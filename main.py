@@ -1,5 +1,5 @@
 """
-main.py — polybot_skuld_v1 (v6.5.3.2 "Skuld" — Speranța hero dashboard, Tier 1 + hold-shadow logging).
+main.py — polybot_skuld_v1 (v6.5.4 "Skuld" — orphan-sell rule, dashboard fee fix, manual cleanup endpoint).
 v6.5.1 — applied 2026-05-09.
 
 ═══════════════════════════════════════════════════════════════════════
@@ -241,7 +241,7 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.5.3.2"
+BOT_VERSION = "6.5.4"
 
 
 # v5.6.0: depth + flow observability constants. All used only by new
@@ -652,6 +652,40 @@ _BS_BSS_MIN_TTR_AT_LEG1_S = float(
 _BS_BSS_SHADOW_TICK_INTERVAL_S = float(
     os.environ.get("BS_BSS_SHADOW_TICK_INTERVAL_S", "3.0") or "3.0"
 )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v6.5.4 SKULD: orphan-sell rule (positive-exit)
+# ═══════════════════════════════════════════════════════════════════
+# When enabled, during the WAITING_2ND hold, the bot evaluates an exit
+# rule on every shadow tick (default 3s cadence). If conditions hold for
+# a configurable number of consecutive ticks, leg-1 is sold at the
+# current bid, locking in a small profit and avoiding the orphan loss.
+#
+# Rule (default thresholds, derived from 49.5h of hold-shadow data):
+#   sell_pnl_now >= BS_BSS_ORPHAN_SELL_MIN_PNL           ($0.00)
+#   AND hold_elapsed_s >= BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S  (90.0s)
+#   AND bin_adverse_since_leg1_bps >= BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS  (0.0)
+#   for BS_BSS_ORPHAN_SELL_PERSIST_TICKS consecutive shadow ticks (2)
+#
+# In-sample (49.5h): saves 85% of orphans (186/220) at the cost of 29%
+# of paireds being exited early (87/301). Net effect: +$233 vs baseline
+# (+$113/day extrapolated). Default DISABLED for safe rollout — flip
+# BS_BSS_ORPHAN_SELL_ENABLED=true to activate.
+_BS_BSS_ORPHAN_SELL_ENABLED = (os.environ.get(
+    "BS_BSS_ORPHAN_SELL_ENABLED", "false") or "false").lower() in ("1", "true", "yes")
+_BS_BSS_ORPHAN_SELL_MIN_PNL = float(
+    os.environ.get("BS_BSS_ORPHAN_SELL_MIN_PNL", "0.0") or "0.0"
+)
+_BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S = float(
+    os.environ.get("BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S", "90.0") or "90.0"
+)
+_BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS = float(
+    os.environ.get("BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS", "0.0") or "0.0"
+)
+_BS_BSS_ORPHAN_SELL_PERSIST_TICKS = int(float(
+    os.environ.get("BS_BSS_ORPHAN_SELL_PERSIST_TICKS", "2") or "2"
+))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1484,6 +1518,15 @@ class MultiDurationMarket:
     bss_hold_l2_visits_below_062: int = 0                # count of dips below 0.62 (proximity to relaxed)
     bss_hold_l2_prev_above_055: bool = True              # for visit-edge detection
     bss_hold_l2_prev_above_062: bool = True
+
+    # v6.5.4: orphan-sell rule (positive-exit). When all three rule
+    # conditions hold across N consecutive shadow ticks, leg-1 is sold
+    # at the current bid. The counter increments each shadow tick when
+    # conditions are met, resets to 0 when they aren't.
+    bss_orphan_sell_consecutive_ticks: int = 0
+    bss_orphan_sold_at: Optional[float] = None       # leg-1 bid at sell moment
+    bss_orphan_sold_ts: Optional[float] = None       # when the sell fired
+    bss_orphan_sold_pnl: Optional[float] = None      # realized sell pnl (incl. fees)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3560,6 +3603,66 @@ def http_server_thread(state: BotState) -> None:
                 self.wfile.write(body)
                 return
 
+            # v6.5.4: human-triggered CSV cleanup. Deletes CSV files older
+            # than the current UTC day from state.log_dir. Requires explicit
+            # ?confirm=true to prevent accidental triggers. Today's actively-
+            # written files are NEVER deleted regardless of confirm.
+            if path == "/api/cleanup" or path == "/api/cleanup/":
+                qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+                confirm_ok = "confirm=true" in qs
+                today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                deleted: List[str] = []
+                preview: List[str] = []
+                errors: List[str] = []
+                if not state.log_dir:
+                    body = json.dumps({
+                        "ok": False, "error": "log_dir not configured",
+                    }).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                try:
+                    log_path = Path(state.log_dir)
+                    for f in sorted(log_path.glob("*.csv")):
+                        # File name must include a date stamp YYYY-MM-DD.
+                        m = re.search(r"(\d{4}-\d{2}-\d{2})\.csv$", f.name)
+                        if not m:
+                            continue
+                        file_date = m.group(1)
+                        if file_date >= today_utc:
+                            continue  # never touch today's active files
+                        if confirm_ok:
+                            try:
+                                f.unlink()
+                                deleted.append(f.name)
+                            except Exception as e:
+                                errors.append(f"{f.name}: {type(e).__name__}: {e}")
+                        else:
+                            preview.append(f.name)
+                except Exception as e:
+                    errors.append(f"scan: {type(e).__name__}: {e}")
+                payload = {
+                    "ok": len(errors) == 0,
+                    "confirm_required": not confirm_ok,
+                    "today_utc": today_utc,
+                    "deleted": deleted,
+                    "would_delete": preview,
+                    "errors": errors,
+                    "hint": ("call /api/cleanup?confirm=true to actually delete"
+                             if not confirm_ok else None),
+                }
+                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             m = re.match(r"^/api/download/([a-z0-9_]+_\d{4}-\d{2}-\d{2}\.csv)$", path)
             if m and state.log_dir:
                 filename = m.group(1)
@@ -5365,7 +5468,7 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
     # ── end DIAG header ─────────────────────────────────────────────────
 
     # Once we've handed off to BOTH or finalized ABORT, nothing to do
-    if mdm.bss_state in ("BOTH", "ABORT", "RESOLVED"):
+    if mdm.bss_state in ("BOTH", "ABORT", "RESOLVED", "ORPHAN_END", "ORPHAN_SOLD"):
         _diag("terminal_state")
         return
 
@@ -5580,6 +5683,17 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
                                                 yes_ask, no_ask,
                                                 yes_bid, no_bid)
                 mdm.bss_last_shadow_ts = now
+                # v6.5.4: orphan-sell rule evaluation runs on the same
+                # cadence as the shadow tick. No-op when
+                # BS_BSS_ORPHAN_SELL_ENABLED=false (default).
+                _bs_evaluate_orphan_sell(state, mdm, now,
+                                          yes_ask, no_ask,
+                                          yes_bid, no_bid)
+                if mdm.bss_state == "ORPHAN_SOLD":
+                    # Rule fired — position closed, exit eval cycle for
+                    # this market. The terminal-state guard at the top
+                    # of the next eval will skip future ticks naturally.
+                    return
 
         # ── Live-window second-leg detection (v6.3.7: patient + floor) ──
         # Maintain sustain timers for both strict (0.50) and relaxed (0.62) tiers.
@@ -6683,6 +6797,178 @@ def _bs_log_bss_hold_shadow_event(state: "BotState", mdm: "MultiDurationMarket",
               f"{type(e).__name__}: {e}", flush=True)
 
 
+# ═══════════════════════════════════════════════════════════════════
+# v6.5.4 SKULD: orphan-sell rule (positive-exit)
+# ═══════════════════════════════════════════════════════════════════
+
+def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
+                              now: float,
+                              yes_ask: float, no_ask: float,
+                              yes_bid: float, no_bid: float) -> None:
+    """v6.5.4: evaluate the orphan-sell rule on this shadow tick.
+
+    Rule: if all three conditions hold simultaneously
+       (a) sell_pnl_now            >= _BS_BSS_ORPHAN_SELL_MIN_PNL
+       (b) hold_elapsed_s          >= _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S
+       (c) bin_adverse_since_leg1_bps >= _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS
+    for _BS_BSS_ORPHAN_SELL_PERSIST_TICKS consecutive ticks, fire the
+    orphan-sell: close leg-1 at current bid, lock in sell_pnl_now,
+    transition state to terminal.
+
+    NO-OP when _BS_BSS_ORPHAN_SELL_ENABLED is false. Safe to call every
+    shadow tick — short-circuits at the env gate.
+    """
+    if not _BS_BSS_ORPHAN_SELL_ENABLED:
+        return
+    if mdm.bss_state != "WAITING_2ND":
+        return
+
+    leg1_side = mdm.bss_first_side
+    leg1_qty = mdm.bss_leg1_qty
+    leg1_size = mdm.bss_leg1_size_usdc
+    leg1_fee = mdm.bss_leg1_fee or 0.0
+    if leg1_side is None or leg1_qty is None or leg1_size is None:
+        return  # incomplete state
+
+    # ── COMPUTE RULE INPUTS ──────────────────────────────────────────
+    leg1_bid_now = yes_bid if leg1_side == "YES" else no_bid
+    if leg1_bid_now is None or leg1_bid_now <= 0:
+        # No bid available — cannot evaluate or fire
+        mdm.bss_orphan_sell_consecutive_ticks = 0
+        return
+
+    sell_proceeds = leg1_qty * leg1_bid_now
+    sell_fee = sell_proceeds * _BS_TAKER_FEE_PCT
+    sell_pnl_now = sell_proceeds - sell_fee - leg1_size - leg1_fee
+
+    hold_elapsed_s = ((now - mdm.bss_first_fill_ts)
+                       if mdm.bss_first_fill_ts else 0.0)
+
+    # bin_adverse_since_leg1_bps — replicates shadow-logger semantics
+    bin_adverse_bps: Optional[float] = None
+    try:
+        if (mdm.bss_hold_bin_price_atleg1
+                and mdm.bss_hold_bin_price_atleg1 > 0
+                and state.binance_prices):
+            bin_snap = list(state.binance_prices)
+            if bin_snap:
+                bin_price_now = bin_snap[-1][1]
+                if bin_price_now and bin_price_now > 0:
+                    bin_delta_bps = (
+                        (bin_price_now / mdm.bss_hold_bin_price_atleg1) - 1.0
+                    ) * 10000.0
+                    # Adverse: positive when BTC moved AGAINST leg-1 direction.
+                    # leg1=YES bets UP, adverse = BTC down = -bin_delta_bps
+                    # leg1=NO  bets DOWN, adverse = BTC up = +bin_delta_bps
+                    if leg1_side == "YES":
+                        bin_adverse_bps = -bin_delta_bps
+                    else:
+                        bin_adverse_bps = bin_delta_bps
+    except Exception:
+        pass
+    if bin_adverse_bps is None:
+        # Without Binance context we cannot evaluate the adverse condition.
+        # Conservative: do not fire.
+        mdm.bss_orphan_sell_consecutive_ticks = 0
+        return
+
+    # ── EVALUATE RULE ────────────────────────────────────────────────
+    conditions_met = (
+        sell_pnl_now >= _BS_BSS_ORPHAN_SELL_MIN_PNL
+        and hold_elapsed_s >= _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S
+        and bin_adverse_bps >= _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS
+    )
+
+    if not conditions_met:
+        mdm.bss_orphan_sell_consecutive_ticks = 0
+        return
+
+    mdm.bss_orphan_sell_consecutive_ticks += 1
+    if mdm.bss_orphan_sell_consecutive_ticks < _BS_BSS_ORPHAN_SELL_PERSIST_TICKS:
+        return
+
+    # ── FIRE: SELL LEG-1 ────────────────────────────────────────────
+    _bs_fire_orphan_sell(state, mdm, now, leg1_bid_now,
+                          sell_pnl_now, hold_elapsed_s, bin_adverse_bps,
+                          yes_ask, no_ask, yes_bid, no_bid)
+
+
+def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
+                          now: float, leg1_bid_now: float,
+                          sell_pnl_now: float, hold_elapsed_s: float,
+                          bin_adverse_bps: float,
+                          yes_ask: float, no_ask: float,
+                          yes_bid: float, no_bid: float) -> None:
+    """v6.5.4: execute the orphan-sell action. Logs BSS_ORPHAN_SELL_DRY
+    event, updates dashboard P&L counter, transitions state to terminal.
+    No leg-2 fill happened, so the position is fully closed at this
+    point — no further resolution flow involved."""
+    leg1_side = mdm.bss_first_side
+    market = mdm.market
+
+    # Stamp the sell on the mdm for downstream / dashboard visibility
+    mdm.bss_orphan_sold_at = leg1_bid_now
+    mdm.bss_orphan_sold_ts = now
+    mdm.bss_orphan_sold_pnl = sell_pnl_now
+    mdm.bss_state = "ORPHAN_SOLD"
+
+    # Update P&L counter (dashboard reflects this immediately)
+    state.bs_pnl_today_usdc += sell_pnl_now
+    state.bs_total_sold_loser += 1   # reuse existing counter for visibility
+
+    # Log the event
+    try:
+        is_live = (state.config.mode == "live")
+        event = "BSS_ORPHAN_SELL_LIVE" if is_live else "BSS_ORPHAN_SELL_DRY"
+        ttr_s = market.end_ts - now
+        note = (f"src=bss_entry,leg=1,side={leg1_side},"
+                f"sold_at={leg1_bid_now:.4f},"
+                f"sell_pnl={sell_pnl_now:+.4f},"
+                f"hold_elapsed={hold_elapsed_s:.1f}s,"
+                f"bin_adverse_bps={bin_adverse_bps:+.1f},"
+                f"persist_ticks={mdm.bss_orphan_sell_consecutive_ticks},"
+                f"ttr={ttr_s:.0f}s")
+        token_id = (market.yes_token_id if leg1_side == "YES"
+                    else market.no_token_id)
+        if state.bs_trades_logger is not None:
+            row = [
+                int(now * 1000),
+                event,
+                market.condition_id,
+                market.slug,
+                market.market_url,
+                f"{market.end_ts:.0f}",
+                leg1_side,
+                token_id,
+                f"{mdm.bss_leg1_actual_ask or 0.0:.4f}",
+                f"{leg1_bid_now:.4f}",
+                f"{mdm.bss_leg1_size_usdc or 0.0:.4f}",
+                f"{mdm.bss_leg1_qty or 0.0:.4f}",
+                f"{leg1_bid_now:.4f}",
+                f"{now:.0f}",
+                f"{sell_pnl_now:+.4f}",
+                "0.0000",
+                state.config.mode,
+                note,
+            ]
+            state.bs_trades_logger.log(row)
+    except Exception as e:
+        print(f"[bss_orphan_sell] log error slug={market.slug}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+    # Clear ring buffer — position closed, no more analysis needed
+    try:
+        _v653_buf_clear(market.condition_id)
+    except Exception:
+        pass
+
+    print(f"[bss_orphan_sell] market={market.condition_id[:10]}… "
+          f"side={leg1_side} sold@{leg1_bid_now:.4f} "
+          f"pnl=${sell_pnl_now:+.4f} "
+          f"elapsed={hold_elapsed_s:.0f}s adv={bin_adverse_bps:+.1f}bps "
+          f"ttr={(market.end_ts - now):.0f}s", flush=True)
+
+
 def _bs_log_bss_leg_fill_event(state: BotState, mdm: MultiDurationMarket,
                                   now: float, leg_num: int, fire_side: str,
                                   decision_ask: float, fill_ask: float,
@@ -6728,6 +7014,14 @@ def _bs_log_bss_leg_fill_event(state: BotState, mdm: MultiDurationMarket,
             note,
         ]
         state.bs_trades_logger.log(row)
+        # v6.5.4: dashboard P&L fix. Until v6.5.3.x, the dashboard counter
+        # state.bs_pnl_today_usdc was updated only on RESOLVE events (which
+        # reflect gross win/loss without fees). The per-leg taker fee was
+        # logged to CSV here (as pnl=-fee) but never accumulated. Result:
+        # dashboard showed +$22.86 while real net was +$8.29 (a $14.57 gap
+        # in the 49.5h audit, exactly matching 743 fills × $0.02 fee).
+        # Add the fee here so the dashboard reflects true net.
+        state.bs_pnl_today_usdc -= fee
     except Exception as e:
         print(f"[bss_log] error leg_fill slug={mdm.market.slug}: "
               f"{type(e).__name__}: {e}", flush=True)
@@ -9009,7 +9303,15 @@ def _print_banner(state: BotState) -> None:
                 ttr_status = "OFF (no TTR floor — v6.5.1 behavior)"
             shadow_status = (f"{_BS_BSS_SHADOW_TICK_INTERVAL_S:.0f}s cadence"
                              if _BS_BSS_SHADOW_TICK_INTERVAL_S > 0 else "OFF")
-            print(f"  *** DRY MODE v6.5.3.2 — per-leg placement, no abort, "
+            orphan_sell_status = (
+                f"ENABLED (pnl>=${_BS_BSS_ORPHAN_SELL_MIN_PNL:.2f}, "
+                f"elapsed>={_BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S:.0f}s, "
+                f"adv>={_BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS:.0f}bps, "
+                f"persist={_BS_BSS_ORPHAN_SELL_PERSIST_TICKS} ticks)"
+                if _BS_BSS_ORPHAN_SELL_ENABLED
+                else "DISABLED (flip BS_BSS_ORPHAN_SELL_ENABLED=true to activate)"
+            )
+            print(f"  *** DRY MODE v6.5.4 — per-leg placement, no abort, "
                   f"book-walk={walk_status} (taker_fee={_BS_TAKER_FEE_PCT*100:.1f}%). "
                   f"v6.5.2 entry filter: {ttr_status}. "
                   f"v6.5.3 Tier-1 logging: ring buffer + extra_json + "
@@ -9017,7 +9319,11 @@ def _print_banner(state: BotState) -> None:
                   f"depth-delta, leg1 bid trajectory, latency, regime). "
                   f"v6.5.3.1 hold-shadow: BSS_HOLD_SHADOW_DRY at "
                   f"{shadow_status} — raw state per tick. "
-                  f"v6.5.3.2 dashboard: Speranța hero header — Toate Pânzele Sus. ***",
+                  f"v6.5.3.2 dashboard: Speranța hero header — Toate Pânzele Sus. "
+                  f"v6.5.4 orphan-sell: {orphan_sell_status}. "
+                  f"v6.5.4 dashboard P&L: fees now included in counter. "
+                  f"v6.5.4 cleanup: GET /api/cleanup?confirm=true to delete "
+                  f"old CSVs. ***",
                   flush=True)
         # Note v6.4.0 deleted env vars if user still has them set
         deleted_set = [v for v in (
