@@ -1,5 +1,5 @@
 """
-main.py — polybot_skuld_v1 (v6.5.4 "Skuld" — orphan-sell rule, dashboard fee fix, manual cleanup endpoint).
+main.py — polybot_skuld_v1 (v6.5.5 "Skuld" — Polymarket fee formula, take-profit rule, dashboard last-15 with orphan-sold).
 v6.5.1 — applied 2026-05-09.
 
 ═══════════════════════════════════════════════════════════════════════
@@ -241,7 +241,7 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.5.4"
+BOT_VERSION = "6.5.5"
 
 
 # v5.6.0: depth + flow observability constants. All used only by new
@@ -605,9 +605,50 @@ _LIVE_BSS_ENABLED = _bool_env("LIVE_BSS_ENABLED", False)
 # regardless of size (legacy v6.3.x behavior).
 _BS_BOOK_WALK_ENABLED = _bool_env("BS_BOOK_WALK_ENABLED", True)
 
-# Taker fee — applied on entry to match LIVE behavior.
-# Default 2% per Polymarket post-January 2026 fee schedule.
+# Taker fee — Polymarket crypto-market formula (v6.5.5):
+#   fee = shares × rate × price × (1 - price)
+# where rate=0.07 for crypto category (BTC up/down). Symmetric peak at
+# p=0.50 ($1.75 on a $50 trade), falls toward extremes.
+# Source: https://docs.polymarket.com/trading/fees (verified May 18 2026).
+#
+# Pre-v6.5.5 the bot used flat 2% which under-counted fees by ~120% for
+# our typical entry prices (mean leg-1 fill ~$0.34 → real fee $0.046,
+# bot was charging $0.020). The 62.4h audit showed bot underreporting
+# ~$22 in fees, flipping the strategy from "near break-even" to "slightly
+# negative" once accounted for.
+#
+# BS_POLYMARKET_TAKER_FEE_RATE = the rate constant in the formula (0.07
+# for crypto markets, 0.0 for geopolitical fee-free markets). Override
+# via env if Polymarket changes the rate or to disable fees in sim.
+# BS_TAKER_FEE_PCT (legacy) = retained for backward compat only — used
+# as the flat-fee fallback when BS_USE_POLYMARKET_FEE_FORMULA=false.
+_BS_POLYMARKET_TAKER_FEE_RATE = float(
+    os.environ.get("BS_POLYMARKET_TAKER_FEE_RATE", "0.07") or "0.07"
+)
+_BS_USE_POLYMARKET_FEE_FORMULA = (os.environ.get(
+    "BS_USE_POLYMARKET_FEE_FORMULA", "true") or "true").lower() in ("1","true","yes")
 _BS_TAKER_FEE_PCT = float(os.environ.get("BS_TAKER_FEE_PCT", "0.02") or "0.02")
+
+
+def _polymarket_taker_fee(shares: float, price: float) -> float:
+    """v6.5.5: compute taker fee for a trade of `shares` at `price`.
+
+    Returns fee in USDC. Uses Polymarket crypto formula by default:
+        fee = shares × rate × price × (1 - price)
+
+    Falls back to flat % when BS_USE_POLYMARKET_FEE_FORMULA=false (for
+    backward-compat sim or testing). Guards against degenerate prices.
+
+    For a $1-sized trade at price p:
+        shares = 1/p, fee = (1/p) × rate × p × (1-p) = rate × (1-p)
+    so the per-$1 fee is rate × (1-p). At p=0.30, rate=0.07 → fee = $0.049.
+    """
+    if shares <= 0 or price <= 0 or price >= 1:
+        return 0.0
+    if _BS_USE_POLYMARKET_FEE_FORMULA:
+        return shares * _BS_POLYMARKET_TAKER_FEE_RATE * price * (1.0 - price)
+    # Legacy fallback: flat % of trade value (= shares × price)
+    return shares * price * _BS_TAKER_FEE_PCT
 
 # Health log cadence
 _BS_HEALTH_LOG_INTERVAL_S = float(os.environ.get("BS_HEALTH_LOG_INTERVAL_S", "10.0") or "10.0")
@@ -685,6 +726,40 @@ _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS = float(
 )
 _BS_BSS_ORPHAN_SELL_PERSIST_TICKS = int(float(
     os.environ.get("BS_BSS_ORPHAN_SELL_PERSIST_TICKS", "2") or "2"
+))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v6.5.5 SKULD: orphan take-profit (TP) rule
+# ═══════════════════════════════════════════════════════════════════
+# Complementary to the orphan-sell defensive exit (which fires at
+# break-even when BTC is adverse). The TP rule fires OPPORTUNISTICALLY
+# when leg-1 bid has recovered substantially above entry — locking in a
+# real profit before potential reversal.
+#
+# Trigger:
+#   leg1_bid_now / leg1_entry_ask >= BS_BSS_ORPHAN_TP_RATIO    (default 1.75)
+#   for BS_BSS_ORPHAN_TP_PERSIST_TICKS consecutive shadow ticks (default 1)
+#
+# Defaults derived from 62.4h audit (May 16-19, with correct Polymarket
+# fees and bid-book-walk slippage modeling):
+#   ratio=1.50, persist=1 → +$47/day, fires on 54% of paireds (aggressive)
+#   ratio=1.75, persist=1 → +$43/day, fires on 25% of paireds (balanced) ← default
+#   ratio=2.00, persist=1 → +$27/day, fires on 9% of paireds (very selective)
+#
+# This is a SEPARATE trigger from orphan-sell. Either rule can fire,
+# whichever fires first wins. TP doesn't require BTC-adverse or elapsed-
+# time conditions — when bid spikes, take the gain.
+#
+# Default DISABLED for safe rollout. Flip BS_BSS_ORPHAN_TP_ENABLED=true
+# after verifying v6.5.5 boot + dashboard + fee fix on Railway.
+_BS_BSS_ORPHAN_TP_ENABLED = (os.environ.get(
+    "BS_BSS_ORPHAN_TP_ENABLED", "false") or "false").lower() in ("1","true","yes")
+_BS_BSS_ORPHAN_TP_RATIO = float(
+    os.environ.get("BS_BSS_ORPHAN_TP_RATIO", "1.75") or "1.75"
+)
+_BS_BSS_ORPHAN_TP_PERSIST_TICKS = int(float(
+    os.environ.get("BS_BSS_ORPHAN_TP_PERSIST_TICKS", "1") or "1"
 ))
 
 
@@ -1527,6 +1602,13 @@ class MultiDurationMarket:
     bss_orphan_sold_at: Optional[float] = None       # leg-1 bid at sell moment
     bss_orphan_sold_ts: Optional[float] = None       # when the sell fired
     bss_orphan_sold_pnl: Optional[float] = None      # realized sell pnl (incl. fees)
+
+    # v6.5.5: take-profit (TP) rule. Independent counter — TP can fire
+    # before, after, or instead of orphan-sell. Reset to 0 when ratio
+    # condition lapses. `bss_orphan_sold_reason` records which rule
+    # actually fired ('positive_exit' or 'take_profit') for telemetry.
+    bss_orphan_tp_consecutive_ticks: int = 0
+    bss_orphan_sold_reason: Optional[str] = None     # 'positive_exit' | 'take_profit'
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2851,23 +2933,58 @@ function fmtAgeShort(sec){if(sec==null||!isFinite(sec))return '';if(sec<60)retur
 function fmtPrice(p){if(p==null)return '—';return Number(p).toFixed(2);}
 function renderRecentTrades(s){
 const list=$('recent-trades-list');
-// v6.1.9: sparkline trades panel.
+// v6.5.5: last 15 trades (was 10). Now includes ORPHAN_SOLD positions
+// from the orphan-sell (positive-exit) and take-profit rules — these
+// are leg-1-only closes that didn't reach resolution.
 //   Schema per row (single line):
 //     [pill] [sold|resolved · winner_badge]   [sparkline 100x24]   [+$X.XX BTC]   [pnl]
 //   Color rule (sparkline + tinted bg):
+//     outcome === 'ORPHAN_SOLD' (TP)        → cyan (opportunistic gain)
+//     outcome === 'ORPHAN_SOLD' (POS_EXIT)  → orange (defensive exit)
 //     outcome === 'LOSS'                    → yellow (attention)
 //     market_winner === 'YES' (good outcome)→ green
 //     market_winner === 'NO'  (good outcome)→ red
 //     else                                  → muted gray
-//   Backend supplies btc_strike + btc_samples (30 floats over trade lifetime,
-//   computed in _bs_collect_btc_samples). On insufficient data → "—" placeholder.
-const hist=((s.bs_state&&s.bs_state.trade_history)||[]).slice(-10).reverse();
+const hist=((s.bs_state&&s.bs_state.trade_history)||[]).slice(-15).reverse();
 if(!hist.length){
   list.innerHTML='<div class="trades-empty" style="color:var(--muted);font-family:var(--mono);font-size:12px;padding:8px 0;">no resolved trades yet</div>';
   return;
 }
 const nowSec=Date.now()/1000;
 list.innerHTML=hist.map(tr=>{
+  // v6.5.5: ORPHAN_SOLD has a different rendering path — no sparkline,
+  // shows entry → sold prices and sell reason instead.
+  if(tr.outcome==='ORPHAN_SOLD'){
+    const reason=tr.sell_reason||'positive_exit';
+    const isTP=(reason==='take_profit');
+    const lineCol=isTP?'#5cb8d9':'#d99340';  // cyan TP, orange positive-exit
+    const pillCls=isTP?'up':'';
+    const pillTxt=isTP?'TP':'P-EXIT';
+    const reasonLabel=isTP
+      ? `1.75× hit · ${(tr.tp_ratio||1.75).toFixed(2)}×`
+      : `bid recovered · adv ${(tr.bin_adverse_bps||0).toFixed(0)}bps`;
+    const pmLink=tr.market_url
+      ? `<a href="${tr.market_url}" target="_blank" rel="noopener" style="color:var(--blue);text-decoration:none;font-size:11px;margin-left:6px;" title="Open on Polymarket">↗</a>`
+      : '';
+    const pnl=tr.sell_pnl||tr.total_pnl||0;
+    const pnlCls=pnl>0.0001?'up':pnl<-0.0001?'down':'';
+    const pnlStr=(pnl>=0?'+$':'-$')+Math.abs(pnl).toFixed(2);
+    const ageSec=tr.close_ts?(nowSec-tr.close_ts):null;
+    const entryAsk=(tr.leg1_entry_ask||0).toFixed(3);
+    const sellPx=(tr.sell_price||0).toFixed(3);
+    const side=tr.leg1_side||'?';
+    const hold=tr.hold_elapsed_s?` · ${tr.hold_elapsed_s.toFixed(0)}s held`:'';
+    const priceDisplay=`<span style="color:var(--muted);font-size:10px;">${side} ${entryAsk}→${sellPx}${hold}</span>`;
+    return `<div class="trade-row" style="display:grid;grid-template-columns:55px 130px 100px 80px 90px 24px;gap:10px;align-items:center;padding:6px 10px;background:transparent;border:none;border-bottom:0.5px solid var(--border-soft);border-radius:0;font-family:var(--mono);font-size:11px;">`
+      +`<span><span class="trade-res ${pillCls}" style="background:${lineCol}22;color:${lineCol};border:1px solid ${lineCol}44;">${pillTxt}</span></span>`
+      +`<span style="color:var(--muted);font-size:10px;">orphan-sold · ${reason==='take_profit'?'TP':'pos-exit'}</span>`
+      +priceDisplay
+      +`<span style="color:var(--muted);font-size:10px;text-align:right;">${reasonLabel}</span>`
+      +`<span class="${pnlCls}" style="text-align:right;font-weight:600;">${pnlStr} <span style="color:var(--muted);font-weight:400;">· ${fmtAgeShort(ageSec)}</span></span>`
+      +`<span style="text-align:center;">${pmLink}</span>`
+      +`</div>`;
+  }
+  // Standard paired-trade rendering (preserved from v6.1.9)
   // Color by outcome priority: LOSS yellow > winner green/red > muted
   let lineCol='#7a7a7a';
   if(tr.outcome==='LOSS') lineCol='#e0b340';
@@ -5813,7 +5930,7 @@ def _bss_simulate_dry_fill(state: BotState, token_id: str,
         fill_ask = decision_ask
         fill_qty = intended_qty
         usdc_committed = size_usdc
-        fee = usdc_committed * _BS_TAKER_FEE_PCT
+        fee = _polymarket_taker_fee(fill_qty, fill_ask)  # v6.5.5: curved Polymarket formula
         return fill_ask, fill_qty, fee, "filled_top"
     
     # Top of book has insufficient size. Decide: walk or partial.
@@ -5822,7 +5939,7 @@ def _bss_simulate_dry_fill(state: BotState, token_id: str,
         fill_ask = decision_ask
         fill_qty = ask_size
         usdc_committed = ask_size * decision_ask
-        fee = usdc_committed * _BS_TAKER_FEE_PCT
+        fee = _polymarket_taker_fee(fill_qty, fill_ask)  # v6.5.5
         return fill_ask, fill_qty, fee, "partial"
     
     # v6.5.1: walk the actual ask_levels ladder. Levels are sorted
@@ -5844,7 +5961,7 @@ def _bss_simulate_dry_fill(state: BotState, token_id: str,
         if qty_filled <= 0:
             return 0.0, 0.0, 0.0, "no_liquidity"
         fill_ask = usdc_committed / qty_filled
-        fee = usdc_committed * _BS_TAKER_FEE_PCT
+        fee = _polymarket_taker_fee(qty_filled, fill_ask)  # v6.5.5: curved formula on VWAP
         if qty_filled < intended_qty - 1e-9:
             return fill_ask, qty_filled, fee, "partial"
         return fill_ask, qty_filled, fee, "filled_walked"
@@ -5858,8 +5975,81 @@ def _bss_simulate_dry_fill(state: BotState, token_id: str,
     fill_qty = intended_qty
     usdc_committed = level1_usdc + level2_usdc
     fill_ask = usdc_committed / fill_qty if fill_qty > 0 else decision_ask
-    fee = usdc_committed * _BS_TAKER_FEE_PCT
+    fee = _polymarket_taker_fee(fill_qty, fill_ask)  # v6.5.5
     return fill_ask, fill_qty, fee, "filled_walked"
+
+
+def _bss_simulate_dry_sell(state: "BotState", token_id: str,
+                            sell_qty: float, top_bid: float
+                            ) -> Tuple[float, float, float, str]:
+    """v6.5.5: simulate a DRY sell with realistic slippage.
+
+    Mirror of `_bss_simulate_dry_fill` but for the EXIT side. Walks the
+    bid book DOWNWARD (best bid first, then next-best, etc) until either
+    we've sold all `sell_qty` shares or the book runs out.
+
+    Returns (avg_sell_price, qty_sold, sell_fee, outcome):
+      - avg_sell_price: VWAP across walked bid levels
+      - qty_sold: shares actually sold (may be < sell_qty on thin books)
+      - sell_fee: Polymarket taker fee on actual filled size
+      - outcome: "filled_top" / "filled_walked" / "partial" / "no_book"
+                 / "no_liquidity"
+
+    Why this matters: the bot used to assume sells fill at `top_bid`
+    fully. In reality, top_bid might have only 5 shares of size while
+    we're selling 10. The remainder fills at next-best bid which is
+    lower. Result: bot over-reported sell proceeds. v6.5.5 walks the
+    bid ladder to give a realistic picture in DRY.
+
+    Bid book invariant: bid_levels is sorted DESCENDING by price (best
+    bid first). top_bid is a hint — function uses bid_levels[0] as
+    ground truth.
+    """
+    book = state.poly_books.get(token_id)
+    if book is None:
+        return 0.0, 0.0, 0.0, "no_book"
+
+    bid_size = float(getattr(book, 'bid_size', 0.0) or 0.0)
+    if bid_size <= 0:
+        return 0.0, 0.0, 0.0, "no_liquidity"
+
+    # Walk the bid ladder if we need more than top-of-book size
+    bid_levels = list(getattr(book, 'bid_levels', []) or [])
+    if not bid_levels:
+        # Fallback: assume top-of-book only
+        if sell_qty <= bid_size:
+            avg_price = top_bid
+            qty_sold = sell_qty
+            fee = _polymarket_taker_fee(qty_sold, avg_price)
+            return avg_price, qty_sold, fee, "filled_top"
+        # Partial
+        avg_price = top_bid
+        qty_sold = bid_size
+        fee = _polymarket_taker_fee(qty_sold, avg_price)
+        return avg_price, qty_sold, fee, "partial"
+
+    # Walk top-down — best bid first
+    qty_filled = 0.0
+    proceeds = 0.0
+    for level_price, level_size in bid_levels:
+        if level_size <= 0 or level_price <= 0:
+            continue
+        if qty_filled >= sell_qty:
+            break
+        qty_remaining = sell_qty - qty_filled
+        take = min(qty_remaining, level_size)
+        qty_filled += take
+        proceeds += take * level_price
+
+    if qty_filled <= 0:
+        return 0.0, 0.0, 0.0, "no_liquidity"
+    avg_price = proceeds / qty_filled
+    fee = _polymarket_taker_fee(qty_filled, avg_price)
+    if qty_filled < sell_qty - 1e-9:
+        return avg_price, qty_filled, fee, "partial"
+    if abs(avg_price - bid_levels[0][0]) < 1e-9:
+        return avg_price, qty_filled, fee, "filled_top"
+    return avg_price, qty_filled, fee, "filled_walked"
 
 
 def _bss_place_live_fak(state: BotState, token_id: str,
@@ -5913,7 +6103,7 @@ def _bss_place_live_fak(state: BotState, token_id: str,
     fill_ask = float(resp.get("price", decision_ask))
     fill_qty = float(resp.get("size_matched", intended_qty))
     usdc_committed = fill_qty * fill_ask
-    fee = usdc_committed * _BS_TAKER_FEE_PCT
+    fee = _polymarket_taker_fee(fill_qty, fill_ask)  # v6.5.5: Polymarket charges this exact fee server-side; we mirror locally for bookkeeping
     return fill_ask, fill_qty, fee, "filled_live"
 
 
@@ -6132,11 +6322,11 @@ def _bss_place_leg2(state: BotState, mdm: MultiDurationMarket, now: float,
     _bs_log_trade_event(state, yes_event, pos, yes_leg,
                          note=f"src=bss_entry,first_side={mdm.bss_first_side},"
                               f"leg_n={'1' if mdm.bss_first_side=='YES' else '2'},"
-                              f"fok={outcome},fee={yes_leg.size_usdc * _BS_TAKER_FEE_PCT:.4f}")
+                              f"fok={outcome},fee={_polymarket_taker_fee(yes_leg.qty_shares, yes_leg.entry_ask):.4f}")
     _bs_log_trade_event(state, no_event, pos, no_leg,
                          note=f"src=bss_entry,first_side={mdm.bss_first_side},"
                               f"leg_n={'1' if mdm.bss_first_side=='NO' else '2'},"
-                              f"fok={outcome},fee={no_leg.size_usdc * _BS_TAKER_FEE_PCT:.4f}")
+                              f"fok={outcome},fee={_polymarket_taker_fee(no_leg.qty_shares, no_leg.entry_ask):.4f}")
     print(f"[bss_entry] LEG2_FILL[{('LIVE' if is_live else 'DRY')}] "
           f"market={market.condition_id[:10]}… "
           f"side={second_side} decision={decision_ask:.4f} "
@@ -6436,9 +6626,9 @@ def _bs_log_bss_hold_shadow_event(state: "BotState", mdm: "MultiDurationMarket",
         leg1_bid_now = yes_bid if leg1_side == "YES" else no_bid
         leg2_ask_now = no_ask if leg1_side == "YES" else yes_ask
 
-        # Hypothetical sell pnl right now
+        # Hypothetical sell pnl right now (v6.5.5: Polymarket curved fee)
         sell_proceeds = leg1_qty * leg1_bid_now
-        sell_fee = sell_proceeds * _BS_TAKER_FEE_PCT
+        sell_fee = _polymarket_taker_fee(leg1_qty, leg1_bid_now)
         sell_pnl_now = sell_proceeds - sell_fee - leg1_size - leg1_fee
         recov_ratio = (leg1_bid_now / leg1_fill_ask
                        if leg1_fill_ask > 0 else 0.0)
@@ -6798,118 +6988,174 @@ def _bs_log_bss_hold_shadow_event(state: "BotState", mdm: "MultiDurationMarket",
 
 
 # ═══════════════════════════════════════════════════════════════════
-# v6.5.4 SKULD: orphan-sell rule (positive-exit)
+# v6.5.4 SKULD: orphan-sell rule (positive-exit) + v6.5.5 TP
 # ═══════════════════════════════════════════════════════════════════
 
 def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                               now: float,
                               yes_ask: float, no_ask: float,
                               yes_bid: float, no_bid: float) -> None:
-    """v6.5.4: evaluate the orphan-sell rule on this shadow tick.
+    """v6.5.4/v6.5.5: evaluate orphan exit rules on this shadow tick.
 
-    Rule: if all three conditions hold simultaneously
-       (a) sell_pnl_now            >= _BS_BSS_ORPHAN_SELL_MIN_PNL
-       (b) hold_elapsed_s          >= _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S
-       (c) bin_adverse_since_leg1_bps >= _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS
-    for _BS_BSS_ORPHAN_SELL_PERSIST_TICKS consecutive ticks, fire the
-    orphan-sell: close leg-1 at current bid, lock in sell_pnl_now,
-    transition state to terminal.
+    Two independent triggers can fire (whichever first):
 
-    NO-OP when _BS_BSS_ORPHAN_SELL_ENABLED is false. Safe to call every
-    shadow tick — short-circuits at the env gate.
+    (A) POSITIVE-EXIT (v6.5.4 defensive — BTC adverse, breakeven):
+        sell_pnl_now            >= _BS_BSS_ORPHAN_SELL_MIN_PNL
+        hold_elapsed_s          >= _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S
+        bin_adverse_since_leg1  >= _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS
+        for N consecutive shadow ticks → sell leg-1, lock in profit.
+
+    (B) TAKE-PROFIT (v6.5.5 opportunistic — bid up ratio×):
+        leg1_bid_now / leg1_entry >= _BS_BSS_ORPHAN_TP_RATIO
+        for M consecutive shadow ticks → sell leg-1, lock in gain.
+
+    Both rules NO-OP when their respective ENABLED flags are false.
+
+    v6.5.5 IMPORTANT: sell pnl is computed using REALISTIC slippage
+    via bid-book walking (`_bss_simulate_dry_sell`). Earlier versions
+    assumed sells fill 100% at top-of-book, over-reporting proceeds.
+    Polymarket curved fee formula (rate × p × (1-p)) is applied.
     """
-    if not _BS_BSS_ORPHAN_SELL_ENABLED:
-        return
     if mdm.bss_state != "WAITING_2ND":
+        return
+    if not (_BS_BSS_ORPHAN_SELL_ENABLED or _BS_BSS_ORPHAN_TP_ENABLED):
         return
 
     leg1_side = mdm.bss_first_side
     leg1_qty = mdm.bss_leg1_qty
     leg1_size = mdm.bss_leg1_size_usdc
     leg1_fee = mdm.bss_leg1_fee or 0.0
-    if leg1_side is None or leg1_qty is None or leg1_size is None:
+    leg1_entry_ask = mdm.bss_leg1_actual_ask
+    if (leg1_side is None or leg1_qty is None
+            or leg1_size is None or leg1_entry_ask is None):
         return  # incomplete state
 
-    # ── COMPUTE RULE INPUTS ──────────────────────────────────────────
-    leg1_bid_now = yes_bid if leg1_side == "YES" else no_bid
-    if leg1_bid_now is None or leg1_bid_now <= 0:
+    # ── COMPUTE REALISTIC SELL VIA BID-WALK ───────────────────────────
+    leg1_top_bid = yes_bid if leg1_side == "YES" else no_bid
+    if leg1_top_bid is None or leg1_top_bid <= 0:
         # No bid available — cannot evaluate or fire
         mdm.bss_orphan_sell_consecutive_ticks = 0
+        mdm.bss_orphan_tp_consecutive_ticks = 0
         return
 
-    sell_proceeds = leg1_qty * leg1_bid_now
-    sell_fee = sell_proceeds * _BS_TAKER_FEE_PCT
+    market = mdm.market
+    token_id = (market.yes_token_id if leg1_side == "YES"
+                else market.no_token_id)
+    # Walk the bid book to get realistic sell proceeds. If book is thin
+    # (partial fill / no_liquidity), reset counters and skip.
+    sell_avg_p, qty_sold, sell_fee, sell_outcome = _bss_simulate_dry_sell(
+        state, token_id, leg1_qty, leg1_top_bid)
+    if sell_outcome in ("no_book", "no_liquidity") or qty_sold <= 0:
+        mdm.bss_orphan_sell_consecutive_ticks = 0
+        mdm.bss_orphan_tp_consecutive_ticks = 0
+        return
+    if sell_outcome == "partial":
+        # Bid book can't fully absorb our size right now. Conservative:
+        # don't fire (LIVE would face the same problem). Reset counters.
+        mdm.bss_orphan_sell_consecutive_ticks = 0
+        mdm.bss_orphan_tp_consecutive_ticks = 0
+        return
+
+    # Realized sell pnl (Polymarket fees, walked bid):
+    #   pnl = qty * avg_sell_price - sell_fee - leg1_cost - leg1_entry_fee
+    sell_proceeds = qty_sold * sell_avg_p
     sell_pnl_now = sell_proceeds - sell_fee - leg1_size - leg1_fee
 
     hold_elapsed_s = ((now - mdm.bss_first_fill_ts)
                        if mdm.bss_first_fill_ts else 0.0)
 
-    # bin_adverse_since_leg1_bps — replicates shadow-logger semantics
-    bin_adverse_bps: Optional[float] = None
-    try:
-        if (mdm.bss_hold_bin_price_atleg1
-                and mdm.bss_hold_bin_price_atleg1 > 0
-                and state.binance_prices):
-            bin_snap = list(state.binance_prices)
-            if bin_snap:
-                bin_price_now = bin_snap[-1][1]
-                if bin_price_now and bin_price_now > 0:
-                    bin_delta_bps = (
-                        (bin_price_now / mdm.bss_hold_bin_price_atleg1) - 1.0
-                    ) * 10000.0
-                    # Adverse: positive when BTC moved AGAINST leg-1 direction.
-                    # leg1=YES bets UP, adverse = BTC down = -bin_delta_bps
-                    # leg1=NO  bets DOWN, adverse = BTC up = +bin_delta_bps
-                    if leg1_side == "YES":
-                        bin_adverse_bps = -bin_delta_bps
-                    else:
-                        bin_adverse_bps = bin_delta_bps
-    except Exception:
-        pass
-    if bin_adverse_bps is None:
-        # Without Binance context we cannot evaluate the adverse condition.
-        # Conservative: do not fire.
-        mdm.bss_orphan_sell_consecutive_ticks = 0
-        return
+    # ── (A) POSITIVE-EXIT RULE ───────────────────────────────────────
+    # Requires Binance adverse signal. Skip the whole branch if disabled.
+    if _BS_BSS_ORPHAN_SELL_ENABLED:
+        bin_adverse_bps: Optional[float] = None
+        try:
+            if (mdm.bss_hold_bin_price_atleg1
+                    and mdm.bss_hold_bin_price_atleg1 > 0
+                    and state.binance_prices):
+                bin_snap = list(state.binance_prices)
+                if bin_snap:
+                    bin_price_now = bin_snap[-1][1]
+                    if bin_price_now and bin_price_now > 0:
+                        bin_delta_bps = (
+                            (bin_price_now / mdm.bss_hold_bin_price_atleg1) - 1.0
+                        ) * 10000.0
+                        if leg1_side == "YES":
+                            bin_adverse_bps = -bin_delta_bps
+                        else:
+                            bin_adverse_bps = bin_delta_bps
+        except Exception:
+            pass
+        if bin_adverse_bps is None:
+            # No Binance context → reset positive-exit counter (still
+            # evaluate TP below).
+            mdm.bss_orphan_sell_consecutive_ticks = 0
+        else:
+            pe_conditions = (
+                sell_pnl_now >= _BS_BSS_ORPHAN_SELL_MIN_PNL
+                and hold_elapsed_s >= _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S
+                and bin_adverse_bps >= _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS
+            )
+            if pe_conditions:
+                mdm.bss_orphan_sell_consecutive_ticks += 1
+                if (mdm.bss_orphan_sell_consecutive_ticks
+                        >= _BS_BSS_ORPHAN_SELL_PERSIST_TICKS):
+                    _bs_fire_orphan_sell(state, mdm, now,
+                                          sell_avg_p, qty_sold, sell_fee,
+                                          sell_pnl_now, hold_elapsed_s,
+                                          bin_adverse_bps, sell_outcome,
+                                          reason="positive_exit",
+                                          yes_ask=yes_ask, no_ask=no_ask,
+                                          yes_bid=yes_bid, no_bid=no_bid)
+                    return
+            else:
+                mdm.bss_orphan_sell_consecutive_ticks = 0
 
-    # ── EVALUATE RULE ────────────────────────────────────────────────
-    conditions_met = (
-        sell_pnl_now >= _BS_BSS_ORPHAN_SELL_MIN_PNL
-        and hold_elapsed_s >= _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S
-        and bin_adverse_bps >= _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS
-    )
-
-    if not conditions_met:
-        mdm.bss_orphan_sell_consecutive_ticks = 0
-        return
-
-    mdm.bss_orphan_sell_consecutive_ticks += 1
-    if mdm.bss_orphan_sell_consecutive_ticks < _BS_BSS_ORPHAN_SELL_PERSIST_TICKS:
-        return
-
-    # ── FIRE: SELL LEG-1 ────────────────────────────────────────────
-    _bs_fire_orphan_sell(state, mdm, now, leg1_bid_now,
-                          sell_pnl_now, hold_elapsed_s, bin_adverse_bps,
-                          yes_ask, no_ask, yes_bid, no_bid)
+    # ── (B) TAKE-PROFIT RULE ────────────────────────────────────────
+    if _BS_BSS_ORPHAN_TP_ENABLED:
+        ratio = leg1_top_bid / leg1_entry_ask if leg1_entry_ask > 0 else 0.0
+        if ratio >= _BS_BSS_ORPHAN_TP_RATIO:
+            mdm.bss_orphan_tp_consecutive_ticks += 1
+            if (mdm.bss_orphan_tp_consecutive_ticks
+                    >= _BS_BSS_ORPHAN_TP_PERSIST_TICKS):
+                _bs_fire_orphan_sell(state, mdm, now,
+                                      sell_avg_p, qty_sold, sell_fee,
+                                      sell_pnl_now, hold_elapsed_s,
+                                      None, sell_outcome,
+                                      reason="take_profit",
+                                      yes_ask=yes_ask, no_ask=no_ask,
+                                      yes_bid=yes_bid, no_bid=no_bid,
+                                      tp_ratio=ratio)
+                return
+        else:
+            mdm.bss_orphan_tp_consecutive_ticks = 0
 
 
 def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
-                          now: float, leg1_bid_now: float,
-                          sell_pnl_now: float, hold_elapsed_s: float,
-                          bin_adverse_bps: float,
+                          now: float,
+                          sell_avg_p: float, qty_sold: float,
+                          sell_fee: float, sell_pnl_now: float,
+                          hold_elapsed_s: float,
+                          bin_adverse_bps: Optional[float],
+                          sell_outcome: str,
+                          reason: str,
                           yes_ask: float, no_ask: float,
-                          yes_bid: float, no_bid: float) -> None:
-    """v6.5.4: execute the orphan-sell action. Logs BSS_ORPHAN_SELL_DRY
-    event, updates dashboard P&L counter, transitions state to terminal.
-    No leg-2 fill happened, so the position is fully closed at this
-    point — no further resolution flow involved."""
+                          yes_bid: float, no_bid: float,
+                          tp_ratio: Optional[float] = None) -> None:
+    """v6.5.5: execute the orphan-sell action. Logs BSS_ORPHAN_SELL_DRY
+    (positive-exit) or BSS_ORPHAN_TP_DRY (take-profit) event, updates
+    dashboard P&L counter, records to trade history for dashboard
+    last-15-trades display, transitions state to terminal."""
     leg1_side = mdm.bss_first_side
     market = mdm.market
+    leg1_entry_ask = mdm.bss_leg1_actual_ask or 0.0
+    leg1_size = mdm.bss_leg1_size_usdc or 0.0
+    leg1_qty = mdm.bss_leg1_qty or 0.0
 
     # Stamp the sell on the mdm for downstream / dashboard visibility
-    mdm.bss_orphan_sold_at = leg1_bid_now
+    mdm.bss_orphan_sold_at = sell_avg_p
     mdm.bss_orphan_sold_ts = now
     mdm.bss_orphan_sold_pnl = sell_pnl_now
+    mdm.bss_orphan_sold_reason = reason
     mdm.bss_state = "ORPHAN_SOLD"
 
     # Update P&L counter (dashboard reflects this immediately)
@@ -6919,14 +7165,21 @@ def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
     # Log the event
     try:
         is_live = (state.config.mode == "live")
-        event = "BSS_ORPHAN_SELL_LIVE" if is_live else "BSS_ORPHAN_SELL_DRY"
+        if reason == "take_profit":
+            event = "BSS_ORPHAN_TP_LIVE" if is_live else "BSS_ORPHAN_TP_DRY"
+        else:
+            event = "BSS_ORPHAN_SELL_LIVE" if is_live else "BSS_ORPHAN_SELL_DRY"
         ttr_s = market.end_ts - now
-        note = (f"src=bss_entry,leg=1,side={leg1_side},"
-                f"sold_at={leg1_bid_now:.4f},"
+        note = (f"src=bss_entry,leg=1,side={leg1_side},reason={reason},"
+                f"entry_ask={leg1_entry_ask:.4f},"
+                f"sold_at={sell_avg_p:.4f},"
+                f"sell_outcome={sell_outcome},"
+                f"qty_sold={qty_sold:.4f},"
+                f"sell_fee={sell_fee:.4f},"
                 f"sell_pnl={sell_pnl_now:+.4f},"
                 f"hold_elapsed={hold_elapsed_s:.1f}s,"
-                f"bin_adverse_bps={bin_adverse_bps:+.1f},"
-                f"persist_ticks={mdm.bss_orphan_sell_consecutive_ticks},"
+                f"bin_adverse_bps={bin_adverse_bps if bin_adverse_bps is None else f'{bin_adverse_bps:+.1f}'},"
+                f"tp_ratio={tp_ratio if tp_ratio is None else f'{tp_ratio:.3f}'},"
                 f"ttr={ttr_s:.0f}s")
         token_id = (market.yes_token_id if leg1_side == "YES"
                     else market.no_token_id)
@@ -6940,11 +7193,11 @@ def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                 f"{market.end_ts:.0f}",
                 leg1_side,
                 token_id,
-                f"{mdm.bss_leg1_actual_ask or 0.0:.4f}",
-                f"{leg1_bid_now:.4f}",
-                f"{mdm.bss_leg1_size_usdc or 0.0:.4f}",
-                f"{mdm.bss_leg1_qty or 0.0:.4f}",
-                f"{leg1_bid_now:.4f}",
+                f"{leg1_entry_ask:.4f}",
+                f"{sell_avg_p:.4f}",
+                f"{leg1_size:.4f}",
+                f"{qty_sold:.4f}",
+                f"{sell_avg_p:.4f}",
                 f"{now:.0f}",
                 f"{sell_pnl_now:+.4f}",
                 "0.0000",
@@ -6956,17 +7209,94 @@ def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
         print(f"[bss_orphan_sell] log error slug={market.slug}: "
               f"{type(e).__name__}: {e}", flush=True)
 
-    # Clear ring buffer — position closed, no more analysis needed
+    # v6.5.5: record in bs_trade_history so dashboard "last 15" shows it
+    try:
+        _bs_record_orphan_sold_history(state, mdm, now,
+                                        sell_avg_p, qty_sold,
+                                        sell_pnl_now, hold_elapsed_s,
+                                        bin_adverse_bps, reason, tp_ratio)
+    except Exception as e:
+        print(f"[bss_orphan_sell] history record error: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+    # Clear ring buffer — position closed
     try:
         _v653_buf_clear(market.condition_id)
     except Exception:
         pass
 
+    extra = (f"adv={bin_adverse_bps:+.1f}bps" if bin_adverse_bps is not None
+             else f"ratio={tp_ratio:.3f}")
     print(f"[bss_orphan_sell] market={market.condition_id[:10]}… "
-          f"side={leg1_side} sold@{leg1_bid_now:.4f} "
-          f"pnl=${sell_pnl_now:+.4f} "
-          f"elapsed={hold_elapsed_s:.0f}s adv={bin_adverse_bps:+.1f}bps "
+          f"reason={reason} side={leg1_side} "
+          f"entry={leg1_entry_ask:.4f}→sold@{sell_avg_p:.4f} "
+          f"({sell_outcome}) pnl=${sell_pnl_now:+.4f} "
+          f"elapsed={hold_elapsed_s:.0f}s {extra} "
           f"ttr={(market.end_ts - now):.0f}s", flush=True)
+
+
+def _bs_record_orphan_sold_history(state: "BotState", mdm: "MultiDurationMarket",
+                                     now: float,
+                                     sell_avg_p: float, qty_sold: float,
+                                     sell_pnl: float, hold_elapsed_s: float,
+                                     bin_adverse_bps: Optional[float],
+                                     reason: str,
+                                     tp_ratio: Optional[float]) -> None:
+    """v6.5.5: append the orphan-sold position to bs_trade_history for
+    the dashboard last-15-trades display. Schema is similar to paired
+    trades but with `outcome='ORPHAN_SOLD'` and includes sell-side fields
+    (sell_price, sell_ts_offset, sell_pnl, sell_reason, etc).
+    """
+    market = mdm.market
+    leg1_side = mdm.bss_first_side or ""
+    leg1_entry_ask = mdm.bss_leg1_actual_ask or 0.0
+    leg1_size = mdm.bss_leg1_size_usdc or 0.0
+    leg1_qty = mdm.bss_leg1_qty or 0.0
+    entry_ts = mdm.bss_first_fill_ts or now
+
+    entry = {
+        "market_id": market.condition_id,
+        "market_url": market.market_url,
+        "slug": market.slug,
+        "outcome": "ORPHAN_SOLD",
+        "market_winner": "",   # we don't know yet — market still pending
+        "had_sell_loser": False,
+        # The leg we held (use yes_* fields if leg1=YES else no_*; the
+        # OTHER side is empty since orphan never filled leg-2)
+        "leg1_side": leg1_side,
+        "leg1_entry_ask": round(leg1_entry_ask, 4),
+        "leg1_qty": round(leg1_qty, 4),
+        "leg1_size_usdc": round(leg1_size, 4),
+        # Sell-specific fields (new in v6.5.5)
+        "sell_price": round(sell_avg_p, 4),
+        "sell_qty": round(qty_sold, 4),
+        "sell_pnl": round(sell_pnl, 4),
+        "sell_reason": reason,
+        "hold_elapsed_s": round(hold_elapsed_s, 1),
+        "bin_adverse_bps": (None if bin_adverse_bps is None
+                             else round(bin_adverse_bps, 1)),
+        "tp_ratio": (None if tp_ratio is None else round(tp_ratio, 3)),
+        # Compat fields for dashboard renderer (paired-trade schema)
+        "total_pnl": round(sell_pnl, 4),
+        "sum_ask_at_entry": round(leg1_entry_ask, 4),
+        "entry_ts": entry_ts,
+        "close_ts": now,
+        # Stub the yes_/no_ leg fields — dashboard branches on outcome
+        "yes_entry_ask": (round(leg1_entry_ask, 4) if leg1_side == "YES"
+                           else 0.0),
+        "yes_close_price": (round(sell_avg_p, 4) if leg1_side == "YES"
+                              else 0.0),
+        "yes_pnl": (round(sell_pnl, 4) if leg1_side == "YES" else 0.0),
+        "no_entry_ask": (round(leg1_entry_ask, 4) if leg1_side == "NO"
+                          else 0.0),
+        "no_close_price": (round(sell_avg_p, 4) if leg1_side == "NO"
+                             else 0.0),
+        "no_pnl": (round(sell_pnl, 4) if leg1_side == "NO" else 0.0),
+    }
+    state.bs_trade_history.append(entry)
+    # Bound memory (mirror paired-history behavior)
+    if len(state.bs_trade_history) > 100:
+        state.bs_trade_history = state.bs_trade_history[-100:]
 
 
 def _bs_log_bss_leg_fill_event(state: BotState, mdm: MultiDurationMarket,
@@ -9311,8 +9641,19 @@ def _print_banner(state: BotState) -> None:
                 if _BS_BSS_ORPHAN_SELL_ENABLED
                 else "DISABLED (flip BS_BSS_ORPHAN_SELL_ENABLED=true to activate)"
             )
-            print(f"  *** DRY MODE v6.5.4 — per-leg placement, no abort, "
-                  f"book-walk={walk_status} (taker_fee={_BS_TAKER_FEE_PCT*100:.1f}%). "
+            tp_status = (
+                f"ENABLED (ratio>={_BS_BSS_ORPHAN_TP_RATIO:.2f}, "
+                f"persist={_BS_BSS_ORPHAN_TP_PERSIST_TICKS} tick)"
+                if _BS_BSS_ORPHAN_TP_ENABLED
+                else "DISABLED (flip BS_BSS_ORPHAN_TP_ENABLED=true to activate)"
+            )
+            fee_status = (
+                f"Polymarket curved ({_BS_POLYMARKET_TAKER_FEE_RATE*100:.0f}%×p×(1-p))"
+                if _BS_USE_POLYMARKET_FEE_FORMULA
+                else f"legacy flat {_BS_TAKER_FEE_PCT*100:.1f}%"
+            )
+            print(f"  *** DRY MODE v6.5.5 — per-leg placement, no abort, "
+                  f"book-walk={walk_status} (taker_fee={fee_status}). "
                   f"v6.5.2 entry filter: {ttr_status}. "
                   f"v6.5.3 Tier-1 logging: ring buffer + extra_json + "
                   f"BSS_CANDIDATE_DRY (pre-entry feats: leg2 microstructure, "
@@ -9320,10 +9661,13 @@ def _print_banner(state: BotState) -> None:
                   f"v6.5.3.1 hold-shadow: BSS_HOLD_SHADOW_DRY at "
                   f"{shadow_status} — raw state per tick. "
                   f"v6.5.3.2 dashboard: Speranța hero header — Toate Pânzele Sus. "
-                  f"v6.5.4 orphan-sell: {orphan_sell_status}. "
-                  f"v6.5.4 dashboard P&L: fees now included in counter. "
-                  f"v6.5.4 cleanup: GET /api/cleanup?confirm=true to delete "
-                  f"old CSVs. ***",
+                  f"v6.5.4 orphan-sell (positive-exit): {orphan_sell_status}. "
+                  f"v6.5.4 dashboard P&L: fees in counter. "
+                  f"v6.5.4 cleanup: GET /api/cleanup?confirm=true. "
+                  f"v6.5.5 take-profit (TP): {tp_status}. "
+                  f"v6.5.5 fee formula: corrected to Polymarket curved. "
+                  f"v6.5.5 DRY sells: bid-walk slippage (no top-fill assumption). "
+                  f"v6.5.5 dashboard: last-15 trades with ORPHAN_SOLD render. ***",
                   flush=True)
         # Note v6.4.0 deleted env vars if user still has them set
         deleted_set = [v for v in (
