@@ -1,5 +1,5 @@
 """
-main.py — polybot_skuld_v1 (v6.5.5 "Skuld" — Polymarket fee formula, take-profit rule, dashboard last-15 with orphan-sold).
+main.py — polybot_skuld_v1 (v6.5.5.2 "Skuld" — locked-spread reject + band-based sustain for orphan-sell).
 v6.5.1 — applied 2026-05-09.
 
 ═══════════════════════════════════════════════════════════════════════
@@ -241,7 +241,7 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.5.5"
+BOT_VERSION = "6.5.5.2"
 
 
 # v5.6.0: depth + flow observability constants. All used only by new
@@ -761,6 +761,46 @@ _BS_BSS_ORPHAN_TP_RATIO = float(
 _BS_BSS_ORPHAN_TP_PERSIST_TICKS = int(float(
     os.environ.get("BS_BSS_ORPHAN_TP_PERSIST_TICKS", "1") or "1"
 ))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v6.5.5.2 SKULD: band-based sustain (replaces tick-counting persist)
+# ═══════════════════════════════════════════════════════════════════
+# The v6.5.4 persist mechanism counted CONSECUTIVE shadow ticks where
+# all conditions held. May 19 data showed the bid wobbles 5-10¢ between
+# consecutive ticks 42% of the time — far too volatile for a "must be
+# identical 2 ticks in a row" rule. Most legitimate profit windows were
+# missed because conditions briefly dipped negative between ticks.
+#
+# v6.5.5.2 replaces tick-counting with timestamp-based band tracking:
+#
+#   - On each tick where conditions ARE met:
+#       * If no qualifying run is in progress, start one (set first_ts)
+#       * Update last_ts to now
+#   - On each tick where conditions are NOT met:
+#       * If the gap since last qualifying tick > GRACE_S: reset both
+#       * Otherwise: tolerate the wobble, leave timestamps alone
+#   - Fire when: conditions met NOW AND (now - first_ts) >= SUSTAIN_S
+#
+# This handles natural price wobble inside a "good enough" band, while
+# still requiring the conditions to actually be sustained across time.
+#
+# SUSTAIN_S defaults match the time equivalent of old PERSIST_TICKS at
+# the 3s tick cadence (orphan-sell: 6s ≈ 2 ticks, TP: 3s ≈ 1 tick).
+# GRACE_S is the wobble tolerance — a brief failure within GRACE_S of
+# the last qualifying tick does NOT reset the run.
+_BS_BSS_ORPHAN_SELL_SUSTAIN_S = float(
+    os.environ.get("BS_BSS_ORPHAN_SELL_SUSTAIN_S", "6.0") or "6.0"
+)
+_BS_BSS_ORPHAN_SELL_GRACE_S = float(
+    os.environ.get("BS_BSS_ORPHAN_SELL_GRACE_S", "3.0") or "3.0"
+)
+_BS_BSS_ORPHAN_TP_SUSTAIN_S = float(
+    os.environ.get("BS_BSS_ORPHAN_TP_SUSTAIN_S", "3.0") or "3.0"
+)
+_BS_BSS_ORPHAN_TP_GRACE_S = float(
+    os.environ.get("BS_BSS_ORPHAN_TP_GRACE_S", "1.0") or "1.0"
+)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1609,6 +1649,17 @@ class MultiDurationMarket:
     # actually fired ('positive_exit' or 'take_profit') for telemetry.
     bss_orphan_tp_consecutive_ticks: int = 0
     bss_orphan_sold_reason: Optional[str] = None     # 'positive_exit' | 'take_profit'
+
+    # v6.5.5.2: band-based sustain timestamps (replace consecutive_ticks
+    # counters). first_qual_ts is when the current qualifying run began;
+    # last_qual_ts is the most recent tick conditions were met. A brief
+    # failure (within GRACE_S of last_qual_ts) tolerates wobble without
+    # resetting; sustained failure (>GRACE_S) clears the run. Fire when
+    # conditions are met NOW AND (now - first_qual_ts) >= SUSTAIN_S.
+    bss_orphan_sell_first_qual_ts: Optional[float] = None
+    bss_orphan_sell_last_qual_ts: Optional[float] = None
+    bss_orphan_tp_first_qual_ts: Optional[float] = None
+    bss_orphan_tp_last_qual_ts: Optional[float] = None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -5663,6 +5714,16 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
     if book_age > 120.0:
         return
 
+    # ── v6.5.5.2 LOCKED-SPREAD REJECT (defensive on entry) ────────────
+    # Same stale-book detection used for orphan-sell. Real Polymarket
+    # orderbooks always have at least 1¢ spread; zero spread means our
+    # in-memory book is on a phantom snapshot from a missed websocket
+    # update. Skip entry decisions on such ticks — they would fire on
+    # prices that don't exist in the real market. The next valid update
+    # will recover the book and the evaluator will resume normally.
+    if _bs_is_book_locked(yes_ask, no_ask, yes_bid, no_bid):
+        return
+
     # ─── Resolution gate ───
     # v6.5.0: when market ends with leg 1 still held (WAITING_2ND/HALF),
     # transition to ORPHAN_END. The held leg becomes a single-leg position
@@ -6305,7 +6366,7 @@ def _bss_place_leg2(state: BotState, mdm: MultiDurationMarket, now: float,
     mdm.bss_state = "BOTH"
     _v653_buf_clear(market.condition_id)  # v6.5.3
     
-    # Log leg 2 fill
+    # Log leg 2 fill (v6.5.5.2: surface floor/strict phase in CSV note)
     _bs_log_bss_leg_fill_event(state, mdm, now, leg_num=2,
                                  fire_side=second_side,
                                  decision_ask=decision_ask,
@@ -6314,7 +6375,8 @@ def _bss_place_leg2(state: BotState, mdm: MultiDurationMarket, now: float,
                                  outcome=outcome, sus_s=sus_s,
                                  is_live=is_live,
                                  yes_ask=yes_ask, no_ask=no_ask,
-                                 yes_bid=yes_bid, no_bid=no_bid)
+                                 yes_bid=yes_bid, no_bid=no_bid,
+                                 phase=phase_label)
     # Log the legacy ENTRY_YES_DRY/LIVE + ENTRY_NO_DRY/LIVE pair so existing
     # downstream analysis CSVs keep working.
     yes_event = "ENTRY_YES_LIVE" if is_live else "ENTRY_YES_DRY"
@@ -6991,6 +7053,74 @@ def _bs_log_bss_hold_shadow_event(state: "BotState", mdm: "MultiDurationMarket",
 # v6.5.4 SKULD: orphan-sell rule (positive-exit) + v6.5.5 TP
 # ═══════════════════════════════════════════════════════════════════
 
+def _bs_is_book_locked(yes_ask: Optional[float], no_ask: Optional[float],
+                        yes_bid: Optional[float], no_bid: Optional[float]) -> bool:
+    """v6.5.5.2: detect stale/ghost orderbook snapshot.
+
+    Real Polymarket orderbooks always have at least 1¢ spread (the
+    platform's tick size). When `yes_ask == yes_bid` (or `no_ask ==
+    no_bid`), the bot's in-memory book has frozen on a phantom snapshot
+    — typically caused by a websocket gap where price-level deltas were
+    missed and the book never converged back to the real state.
+
+    The signature of these phantoms is dead simple: `yes_ask = yes_bid =
+    0.505` and `no_ask = no_bid = 0.495` (the "locked at 50/50" state),
+    while the real depth book shows the market actually collapsed to
+    0.99/0.01 or similar extreme.
+
+    The May 19 audit found 23 of 24 phantom orphan-sell fires occurred
+    on ticks with zero spread. Decisions made on these ticks would fire
+    on prices that don't exist in the real market — booking fake DRY
+    profit and (in LIVE) submitting sell orders that immediately fail.
+
+    Returns True if the book appears stale and decisions should skip.
+    """
+    if (yes_ask is None or yes_bid is None
+            or no_ask is None or no_bid is None):
+        return True  # incomplete data treated as stale (defensive)
+    if yes_ask <= 0 or no_ask <= 0:
+        return True  # zero prices = collapsed/uninitialized book
+    # A real Polymarket orderbook always has ask > bid (at least 1¢).
+    return (yes_ask - yes_bid) <= 0 or (no_ask - no_bid) <= 0
+
+
+def _bs_update_band_sustain(mdm: "MultiDurationMarket",
+                             condition_met: bool, now: float,
+                             first_attr: str, last_attr: str,
+                             grace_s: float) -> Tuple[bool, float]:
+    """v6.5.5.2: update band-based sustain timestamps for a rule.
+
+    Replaces tick-counting persist mechanism with timestamp tracking
+    that tolerates brief wobble (gaps shorter than `grace_s`).
+
+    Logic:
+      - If condition is met NOW:
+          * Set first_attr if None (start of run)
+          * Update last_attr to now
+          * Return (True, run_duration_s)
+      - If condition is NOT met:
+          * If we have an active run AND gap since last > grace_s:
+            reset both (sustained failure)
+          * Otherwise: leave timestamps alone (brief wobble tolerated)
+          * Return (False, 0.0)
+
+    The caller checks the returned run_duration against its SUSTAIN_S
+    threshold and fires only when conditions are met NOW.
+    """
+    if condition_met:
+        if getattr(mdm, first_attr) is None:
+            setattr(mdm, first_attr, now)
+        setattr(mdm, last_attr, now)
+        first_ts = getattr(mdm, first_attr)
+        return True, now - first_ts
+    else:
+        last_ts = getattr(mdm, last_attr)
+        if last_ts is not None and (now - last_ts) > grace_s:
+            setattr(mdm, first_attr, None)
+            setattr(mdm, last_attr, None)
+        return False, 0.0
+
+
 def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                               now: float,
                               yes_ask: float, no_ask: float,
@@ -7011,14 +7141,28 @@ def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
 
     Both rules NO-OP when their respective ENABLED flags are false.
 
-    v6.5.5 IMPORTANT: sell pnl is computed using REALISTIC slippage
-    via bid-book walking (`_bss_simulate_dry_sell`). Earlier versions
-    assumed sells fill 100% at top-of-book, over-reporting proceeds.
-    Polymarket curved fee formula (rate × p × (1-p)) is applied.
+    v6.5.5.1 CASHOUT FIX: sell pnl uses `leg1_top_bid` directly (the
+    cashout proxy) rather than walking the bid book. Matches the May 1
+    "cashout style" agreement: "cashout always works — no liquidity
+    concerns". Polymarket curved fee formula (rate × p × (1-p)) is
+    applied as before. The book-walk simulator (`_bss_simulate_dry_sell`)
+    remains in the codebase for future LIVE-realism work but no longer
+    gates firing decisions.
     """
     if mdm.bss_state != "WAITING_2ND":
         return
     if not (_BS_BSS_ORPHAN_SELL_ENABLED or _BS_BSS_ORPHAN_TP_ENABLED):
+        return
+
+    # ── v6.5.5.2 LOCKED-SPREAD REJECT ────────────────────────────────
+    # If the in-memory orderbook is in the "locked at 50/50" stale state
+    # (yes_ask == yes_bid, no_ask == no_bid), our price view is a phantom
+    # and any sell decision based on it would fire on a price that does
+    # not exist in the real market. The May 19 audit found 23 of 24
+    # phantom orphan-sell fires occurred on locked-spread ticks. Skip
+    # the entire evaluation, including band-sustain updates. The book
+    # will recover on the next valid websocket update.
+    if _bs_is_book_locked(yes_ask, no_ask, yes_bid, no_bid):
         return
 
     leg1_side = mdm.bss_first_side
@@ -7033,31 +7177,42 @@ def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
     # ── COMPUTE REALISTIC SELL VIA BID-WALK ───────────────────────────
     leg1_top_bid = yes_bid if leg1_side == "YES" else no_bid
     if leg1_top_bid is None or leg1_top_bid <= 0:
-        # No bid available — cannot evaluate or fire
-        mdm.bss_orphan_sell_consecutive_ticks = 0
-        mdm.bss_orphan_tp_consecutive_ticks = 0
+        # No bid available — cannot evaluate or fire. Clear band-sustain
+        # state defensively (a missing bid is sustained failure).
+        mdm.bss_orphan_sell_first_qual_ts = None
+        mdm.bss_orphan_sell_last_qual_ts = None
+        mdm.bss_orphan_tp_first_qual_ts = None
+        mdm.bss_orphan_tp_last_qual_ts = None
         return
 
     market = mdm.market
     token_id = (market.yes_token_id if leg1_side == "YES"
                 else market.no_token_id)
-    # Walk the bid book to get realistic sell proceeds. If book is thin
-    # (partial fill / no_liquidity), reset counters and skip.
-    sell_avg_p, qty_sold, sell_fee, sell_outcome = _bss_simulate_dry_sell(
-        state, token_id, leg1_qty, leg1_top_bid)
-    if sell_outcome in ("no_book", "no_liquidity") or qty_sold <= 0:
-        mdm.bss_orphan_sell_consecutive_ticks = 0
-        mdm.bss_orphan_tp_consecutive_ticks = 0
-        return
-    if sell_outcome == "partial":
-        # Bid book can't fully absorb our size right now. Conservative:
-        # don't fire (LIVE would face the same problem). Reset counters.
-        mdm.bss_orphan_sell_consecutive_ticks = 0
-        mdm.bss_orphan_tp_consecutive_ticks = 0
-        return
 
-    # Realized sell pnl (Polymarket fees, walked bid):
-    #   pnl = qty * avg_sell_price - sell_fee - leg1_cost - leg1_entry_fee
+    # v6.5.5.1 CASHOUT FIX: Use leg1_top_bid directly as the cashout
+    # proxy, matching the shadow logger and the cashout convention we
+    # agreed in the May 1 design discussion ("cashout always works — no
+    # liquidity concerns; price ≈ best bid").
+    #
+    # v6.5.5 used `_bss_simulate_dry_sell` to walk the bid book and gate
+    # on `bid_size`/levels. That was wrong: it returned no_liquidity on
+    # ghost-bid moments (visible price, zero depth) and blocked 75+
+    # seconds of +$0.82 fires on the 0x59bd47e1 trade. The book-walk
+    # simulator is RETAINED in the codebase for future LIVE realism work
+    # (and a diagnostic) but is no longer used to gate firing decisions.
+    #
+    # Under the cashout convention:
+    #   - Fill quantity = leg1_qty (full position, no partials)
+    #   - Fill price    = leg1_top_bid (the cashout proxy)
+    #   - Fill fee      = Polymarket curved formula on (qty, top_bid)
+    #   - Outcome       = "cashout" (informational tag)
+    sell_avg_p = leg1_top_bid
+    qty_sold = leg1_qty
+    sell_fee = _polymarket_taker_fee(qty_sold, sell_avg_p)
+    sell_outcome = "cashout"
+
+    # Realized sell pnl (Polymarket curved fee, cashout-style fill):
+    #   pnl = qty * cashout_price - sell_fee - leg1_cost - leg1_entry_fee
     sell_proceeds = qty_sold * sell_avg_p
     sell_pnl_now = sell_proceeds - sell_fee - leg1_size - leg1_fee
 
@@ -7086,48 +7241,62 @@ def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
         except Exception:
             pass
         if bin_adverse_bps is None:
-            # No Binance context → reset positive-exit counter (still
-            # evaluate TP below).
-            mdm.bss_orphan_sell_consecutive_ticks = 0
+            # No Binance context → mark conditions not-met (band logic
+            # will tolerate brief gaps but reset on sustained absence).
+            _bs_update_band_sustain(
+                mdm, condition_met=False, now=now,
+                first_attr="bss_orphan_sell_first_qual_ts",
+                last_attr="bss_orphan_sell_last_qual_ts",
+                grace_s=_BS_BSS_ORPHAN_SELL_GRACE_S,
+            )
         else:
             pe_conditions = (
                 sell_pnl_now >= _BS_BSS_ORPHAN_SELL_MIN_PNL
                 and hold_elapsed_s >= _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S
                 and bin_adverse_bps >= _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS
             )
-            if pe_conditions:
-                mdm.bss_orphan_sell_consecutive_ticks += 1
-                if (mdm.bss_orphan_sell_consecutive_ticks
-                        >= _BS_BSS_ORPHAN_SELL_PERSIST_TICKS):
-                    _bs_fire_orphan_sell(state, mdm, now,
-                                          sell_avg_p, qty_sold, sell_fee,
-                                          sell_pnl_now, hold_elapsed_s,
-                                          bin_adverse_bps, sell_outcome,
-                                          reason="positive_exit",
-                                          yes_ask=yes_ask, no_ask=no_ask,
-                                          yes_bid=yes_bid, no_bid=no_bid)
-                    return
-            else:
-                mdm.bss_orphan_sell_consecutive_ticks = 0
+            qualified_now, run_duration_s = _bs_update_band_sustain(
+                mdm, condition_met=pe_conditions, now=now,
+                first_attr="bss_orphan_sell_first_qual_ts",
+                last_attr="bss_orphan_sell_last_qual_ts",
+                grace_s=_BS_BSS_ORPHAN_SELL_GRACE_S,
+            )
+            # Fire only when conditions are met RIGHT NOW (fresh bid,
+            # fresh pnl) AND the qualifying run has lasted SUSTAIN_S+.
+            # The intermediate wobble (within GRACE_S) is tolerated by
+            # the band-sustain helper.
+            if (qualified_now
+                    and run_duration_s >= _BS_BSS_ORPHAN_SELL_SUSTAIN_S):
+                _bs_fire_orphan_sell(state, mdm, now,
+                                      sell_avg_p, qty_sold, sell_fee,
+                                      sell_pnl_now, hold_elapsed_s,
+                                      bin_adverse_bps, sell_outcome,
+                                      reason="positive_exit",
+                                      yes_ask=yes_ask, no_ask=no_ask,
+                                      yes_bid=yes_bid, no_bid=no_bid)
+                return
 
     # ── (B) TAKE-PROFIT RULE ────────────────────────────────────────
     if _BS_BSS_ORPHAN_TP_ENABLED:
         ratio = leg1_top_bid / leg1_entry_ask if leg1_entry_ask > 0 else 0.0
-        if ratio >= _BS_BSS_ORPHAN_TP_RATIO:
-            mdm.bss_orphan_tp_consecutive_ticks += 1
-            if (mdm.bss_orphan_tp_consecutive_ticks
-                    >= _BS_BSS_ORPHAN_TP_PERSIST_TICKS):
-                _bs_fire_orphan_sell(state, mdm, now,
-                                      sell_avg_p, qty_sold, sell_fee,
-                                      sell_pnl_now, hold_elapsed_s,
-                                      None, sell_outcome,
-                                      reason="take_profit",
-                                      yes_ask=yes_ask, no_ask=no_ask,
-                                      yes_bid=yes_bid, no_bid=no_bid,
-                                      tp_ratio=ratio)
-                return
-        else:
-            mdm.bss_orphan_tp_consecutive_ticks = 0
+        tp_condition = ratio >= _BS_BSS_ORPHAN_TP_RATIO
+        qualified_now_tp, run_duration_s_tp = _bs_update_band_sustain(
+            mdm, condition_met=tp_condition, now=now,
+            first_attr="bss_orphan_tp_first_qual_ts",
+            last_attr="bss_orphan_tp_last_qual_ts",
+            grace_s=_BS_BSS_ORPHAN_TP_GRACE_S,
+        )
+        if (qualified_now_tp
+                and run_duration_s_tp >= _BS_BSS_ORPHAN_TP_SUSTAIN_S):
+            _bs_fire_orphan_sell(state, mdm, now,
+                                  sell_avg_p, qty_sold, sell_fee,
+                                  sell_pnl_now, hold_elapsed_s,
+                                  None, sell_outcome,
+                                  reason="take_profit",
+                                  yes_ask=yes_ask, no_ask=no_ask,
+                                  yes_bid=yes_bid, no_bid=no_bid,
+                                  tp_ratio=ratio)
+            return
 
 
 def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
@@ -7305,10 +7474,18 @@ def _bs_log_bss_leg_fill_event(state: BotState, mdm: MultiDurationMarket,
                                   fill_qty: float, fee: float, size_usdc: float,
                                   outcome: str, sus_s: float, is_live: bool,
                                   yes_ask: float, no_ask: float,
-                                  yes_bid: float, no_bid: float) -> None:
+                                  yes_bid: float, no_bid: float,
+                                  phase: Optional[str] = None) -> None:
     """v6.5.0: log a per-leg fill event. event = BSS_LEG_FILL_DRY or _LIVE.
     Captures actual fill data (price, qty, fee) separately from decision price.
-    Slippage = fill_ask - decision_ask (positive when book moved up)."""
+    Slippage = fill_ask - decision_ask (positive when book moved up).
+
+    v6.5.5.2: optional `phase` parameter ("floor" | "strict" | "relaxed")
+    surfaces second-leg firing path in the CSV note for analytics. Floor
+    fires (sustain=0, deep-dip) and strict/relaxed (timed sustain) are
+    logged identically otherwise; this distinction was previously visible
+    only in stdout log lines, not in trade history.
+    """
     if state.bs_trades_logger is None:
         return
     try:
@@ -7316,7 +7493,8 @@ def _bs_log_bss_leg_fill_event(state: BotState, mdm: MultiDurationMarket,
         event = "BSS_LEG_FILL_LIVE" if is_live else "BSS_LEG_FILL_DRY"
         slippage = fill_ask - decision_ask
         ttr_s = market.end_ts - now
-        note = (f"src=bss_entry,leg={leg_num},"
+        phase_part = f",phase={phase}" if phase else ""
+        note = (f"src=bss_entry,leg={leg_num}{phase_part},"
                 f"decision_ask={decision_ask:.4f},"
                 f"fill_ask={fill_ask:.4f},slippage={slippage:+.4f},"
                 f"qty={fill_qty:.4f},fee={fee:.4f},"
@@ -9652,7 +9830,7 @@ def _print_banner(state: BotState) -> None:
                 if _BS_USE_POLYMARKET_FEE_FORMULA
                 else f"legacy flat {_BS_TAKER_FEE_PCT*100:.1f}%"
             )
-            print(f"  *** DRY MODE v6.5.5 — per-leg placement, no abort, "
+            print(f"  *** DRY MODE v6.5.5.2 — per-leg placement, no abort, "
                   f"book-walk={walk_status} (taker_fee={fee_status}). "
                   f"v6.5.2 entry filter: {ttr_status}. "
                   f"v6.5.3 Tier-1 logging: ring buffer + extra_json + "
@@ -9666,7 +9844,16 @@ def _print_banner(state: BotState) -> None:
                   f"v6.5.4 cleanup: GET /api/cleanup?confirm=true. "
                   f"v6.5.5 take-profit (TP): {tp_status}. "
                   f"v6.5.5 fee formula: corrected to Polymarket curved. "
-                  f"v6.5.5 DRY sells: bid-walk slippage (no top-fill assumption). "
+                  f"v6.5.5.1 CASHOUT FIX: orphan-sell uses leg1_bid_now (cashout), "
+                  f"no longer gated on book-walk. "
+                  f"v6.5.5.2 LOCKED-SPREAD REJECT: skip ticks where "
+                  f"yes_ask==yes_bid or no_ask==no_bid (ghost snapshots). "
+                  f"v6.5.5.2 BAND-SUSTAIN: orphan-sell uses time-based "
+                  f"sustain ({_BS_BSS_ORPHAN_SELL_SUSTAIN_S:.0f}s with "
+                  f"{_BS_BSS_ORPHAN_SELL_GRACE_S:.0f}s wobble grace), "
+                  f"TP uses {_BS_BSS_ORPHAN_TP_SUSTAIN_S:.0f}s sustain / "
+                  f"{_BS_BSS_ORPHAN_TP_GRACE_S:.0f}s grace. "
+                  f"v6.5.5.2 phase visibility: floor/strict tagged in CSV. "
                   f"v6.5.5 dashboard: last-15 trades with ORPHAN_SOLD render. ***",
                   flush=True)
         # Note v6.4.0 deleted env vars if user still has them set
