@@ -1,5 +1,5 @@
 """
-main.py — polybot_skuld_v1 (v6.5.5.2 "Skuld" — locked-spread reject + band-based sustain for orphan-sell).
+main.py — polybot_skuld_v1 (v6.5.6 "Skuld" — LIVE orphan-sell: real CLOB FAK orders for orphan-sell + take-profit rules).
 v6.5.1 — applied 2026-05-09.
 
 ═══════════════════════════════════════════════════════════════════════
@@ -241,7 +241,7 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.5.5.2"
+BOT_VERSION = "6.5.6"
 
 
 # v5.6.0: depth + flow observability constants. All used only by new
@@ -3227,6 +3227,48 @@ if(bssActive){
         ${p.bss_state==='BOTH'?`<span>cost <b style="color:var(--text);">$${((p.first_price||0)+(p.second_price||0)).toFixed(4)}</b></span><span>if win: <b style="color:var(--green);">+$${(1.0/Math.max(p.first_price||1,p.second_price||1) - 2.0).toFixed(4)}</b></span>`:''}
         ${p.bss_state==='WATCH'?`<span>need either side &lt;${(p.t_first||0.45).toFixed(2)} for ${(p.sustain_first_s||4).toFixed(0)}s · YES sus ${(p.yes_sustain_s||0).toFixed(1)}s · NO sus ${(p.no_sustain_s||0).toFixed(1)}s</span>`:''}
       </div>
+      ${p.bss_state==='WAITING_2ND' && (p.orphan_sell_enabled || p.orphan_tp_enabled)?(()=>{
+        // v6.5.5.3: in-flight orphan-sell indicator
+        const pnlNow = p.orphan_sell_pnl_now||0;
+        const tpRatio = p.orphan_tp_ratio_now||0;
+        const tpThr = p.orphan_tp_ratio_thr||1.75;
+        // Positive-exit run progress
+        const peRun = p.orphan_sell_run_s||0;
+        const peSustain = p.orphan_sell_sustain_s||6;
+        const pePct = Math.min(100, Math.round(peRun/peSustain*100));
+        // TP run progress
+        const tpRun = p.orphan_tp_run_s||0;
+        const tpSustain = p.orphan_tp_sustain_s||3;
+        const tpPct = Math.min(100, Math.round(tpRun/tpSustain*100));
+        // Status text + color
+        const peArmed = peRun > 0;
+        const tpArmed = tpRun > 0;
+        const willFire = (peArmed && peRun >= peSustain) || (tpArmed && tpRun >= tpSustain);
+        const statusColor = willFire ? 'var(--red)' : (peArmed || tpArmed ? 'var(--yellow)' : 'var(--muted)');
+        const statusText = willFire ? '⚡ SELL ARMED' : (peArmed || tpArmed ? '◐ approaching sell' : 'monitoring');
+        const bidStr = (p.leg1_top_bid||0).toFixed(4);
+        const entryStr = (p.leg1_entry_ask||0).toFixed(4);
+        return `<div style="margin-top:6px;padding:8px;background:rgba(255,255,255,0.03);border-radius:4px;border-left:2px solid ${statusColor};font-size:11px;">
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+            <span style="color:${statusColor};font-weight:600;">${statusText}</span>
+            <span style="color:var(--muted);">bid ${bidStr} · entry ${entryStr} · would-sell <b style="color:${pnlNow>=0?'var(--green)':'var(--red)'};">${pnlNow>=0?'+':''}$${pnlNow.toFixed(4)}</b></span>
+          </div>
+          ${p.orphan_sell_enabled?`<div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;">
+            <span style="min-width:80px;color:var(--muted);">positive-exit</span>
+            <div style="flex:1;height:6px;background:rgba(255,255,255,0.06);border-radius:3px;overflow:hidden;">
+              <div style="width:${pePct}%;height:100%;background:${peRun>=peSustain?'var(--red)':'var(--yellow)'};transition:width 0.3s;"></div>
+            </div>
+            <span style="min-width:60px;text-align:right;color:var(--muted);">${peRun.toFixed(1)}/${peSustain.toFixed(0)}s</span>
+          </div>`:''}
+          ${p.orphan_tp_enabled?`<div style="display:flex;align-items:center;gap:8px;">
+            <span style="min-width:80px;color:var(--muted);">take-profit</span>
+            <div style="flex:1;height:6px;background:rgba(255,255,255,0.06);border-radius:3px;overflow:hidden;">
+              <div style="width:${tpPct}%;height:100%;background:${tpRun>=tpSustain?'var(--red)':'var(--cyan,#3b82f6)'};transition:width 0.3s;"></div>
+            </div>
+            <span style="min-width:60px;text-align:right;color:var(--muted);">ratio ${tpRatio.toFixed(2)}/${tpThr.toFixed(2)} · ${tpRun.toFixed(1)}/${tpSustain.toFixed(0)}s</span>
+          </div>`:''}
+        </div>`;
+      })():''}
     </div>`;
   }
   // Compact row for non-active items
@@ -3555,6 +3597,55 @@ def _build_status_payload(state: BotState) -> dict:
                     "abort_in_s": abort_in,
                     "in_pre_market": in_pre_market_now,
                     "pre_market_remaining_s": None,
+                })
+
+                # ── v6.5.5.3 IN-FLIGHT ORPHAN-SELL INDICATOR ────────
+                # Surfaces both rule states so the dashboard can show
+                # "this orphan is about to be sold" before it fires.
+                # Computes the same fields the orphan-sell evaluator
+                # uses, without ever firing (read-only snapshot).
+                leg1_side = mdm.bss_first_side
+                leg1_top_bid = ((yb if leg1_side == "YES" else nb)
+                                 if leg1_side else 0.0)
+                leg1_qty = mdm.bss_leg1_qty or 0.0
+                leg1_size = mdm.bss_leg1_size_usdc or 1.0
+                leg1_fee_paid = mdm.bss_leg1_fee or 0.0
+                leg1_entry_ask = mdm.bss_leg1_actual_ask or 0.0
+
+                # Current would-sell pnl (cashout convention)
+                if leg1_top_bid and leg1_qty:
+                    _sell_fee = _polymarket_taker_fee(
+                        leg1_qty, leg1_top_bid)
+                    sell_pnl_now = (leg1_qty * leg1_top_bid - _sell_fee
+                                     - leg1_size - leg1_fee_paid)
+                else:
+                    sell_pnl_now = 0.0
+
+                # Current TP ratio (vs entry ask)
+                tp_ratio_now = ((leg1_top_bid / leg1_entry_ask)
+                                 if leg1_entry_ask > 0 else 0.0)
+
+                # In-flight band-sustain progress (timestamps live on mdm,
+                # updated by the orphan-sell evaluator each shadow tick)
+                pe_first = mdm.bss_orphan_sell_first_qual_ts
+                tp_first = mdm.bss_orphan_tp_first_qual_ts
+                pe_run = (now - pe_first) if pe_first else 0.0
+                tp_run = (now - tp_first) if tp_first else 0.0
+
+                entry.update({
+                    "orphan_sell_enabled": _BS_BSS_ORPHAN_SELL_ENABLED,
+                    "orphan_sell_pnl_now": round(sell_pnl_now, 4),
+                    "orphan_sell_run_s": round(pe_run, 1),
+                    "orphan_sell_sustain_s": _BS_BSS_ORPHAN_SELL_SUSTAIN_S,
+                    "orphan_sell_min_pnl": _BS_BSS_ORPHAN_SELL_MIN_PNL,
+                    "orphan_sell_min_elapsed_s": _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S,
+                    "orphan_tp_enabled": _BS_BSS_ORPHAN_TP_ENABLED,
+                    "orphan_tp_ratio_now": round(tp_ratio_now, 3),
+                    "orphan_tp_ratio_thr": _BS_BSS_ORPHAN_TP_RATIO,
+                    "orphan_tp_run_s": round(tp_run, 1),
+                    "orphan_tp_sustain_s": _BS_BSS_ORPHAN_TP_SUSTAIN_S,
+                    "leg1_top_bid": round(leg1_top_bid, 4) if leg1_top_bid else 0.0,
+                    "leg1_entry_ask": round(leg1_entry_ask, 4),
                 })
             if mdm.bss_state in ("ABORT", "RESOLVED") and mdm.bss_abort_sold_at:
                 # Compute realized P&L from abort
@@ -5636,7 +5727,7 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
     # ── end DIAG header ─────────────────────────────────────────────────
 
     # Once we've handed off to BOTH or finalized ABORT, nothing to do
-    if mdm.bss_state in ("BOTH", "ABORT", "RESOLVED", "ORPHAN_END", "ORPHAN_SOLD"):
+    if mdm.bss_state in ("BOTH", "ABORT", "RESOLVED", "ORPHAN_END", "ORPHAN_SOLD", "ORPHAN_SOLD_PARTIAL"):
         _diag("terminal_state")
         return
 
@@ -5714,6 +5805,29 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
     if book_age > 120.0:
         return
 
+    # ─── Resolution gate ───
+    # v6.5.0: when market ends with leg 1 still held (WAITING_2ND/HALF),
+    # transition to ORPHAN_END. The held leg becomes a single-leg position
+    # held to CTF resolution. No sell, no fake P&L.
+    #
+    # v6.5.5.3: this MUST run before any other gate. When a market ends,
+    # the orderbook naturally locks (trading stops; book freezes at the
+    # resolution price). The locked-spread reject below would otherwise
+    # catch this and return early — leaving orphans silently abandoned,
+    # never settled, never logged as losses. v6.5.5.2 had this bug:
+    # 14/46 orphans on May 20 were dropped without settlement, hiding
+    # $14 of real losses behind a fake +$10.53 P&L.
+    if now >= market.end_ts:
+        # v6.5.6: ORPHAN_SOLD_PARTIAL means a LIVE FAK partially filled
+        # the orphan-sell — some shares were sold (P&L already booked),
+        # some remain in the wallet awaiting natural CTF resolution.
+        # _bss_handle_window_end_orphan uses mdm.bss_leg1_qty which was
+        # reduced to the remaining shares at partial-fill time.
+        if mdm.bss_state in ("WAITING_2ND", "ORPHAN_SOLD_PARTIAL"):
+            _bss_handle_window_end_orphan(state, mdm, now,
+                                            yes_ask, no_ask, yes_bid, no_bid)
+        return
+
     # ── v6.5.5.2 LOCKED-SPREAD REJECT (defensive on entry) ────────────
     # Same stale-book detection used for orphan-sell. Real Polymarket
     # orderbooks always have at least 1¢ spread; zero spread means our
@@ -5721,17 +5835,9 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
     # update. Skip entry decisions on such ticks — they would fire on
     # prices that don't exist in the real market. The next valid update
     # will recover the book and the evaluator will resume normally.
+    #
+    # v6.5.5.3: moved AFTER resolution gate. See above for rationale.
     if _bs_is_book_locked(yes_ask, no_ask, yes_bid, no_bid):
-        return
-
-    # ─── Resolution gate ───
-    # v6.5.0: when market ends with leg 1 still held (WAITING_2ND/HALF),
-    # transition to ORPHAN_END. The held leg becomes a single-leg position
-    # held to CTF resolution. No sell, no fake P&L.
-    if now >= market.end_ts:
-        if mdm.bss_state == "WAITING_2ND":
-            _bss_handle_window_end_orphan(state, mdm, now,
-                                            yes_ask, no_ask, yes_bid, no_bid)
         return
 
     # v6.4.0 SKULD: live-window-only. Skip everything before window opens.
@@ -6166,6 +6272,101 @@ def _bss_place_live_fak(state: BotState, token_id: str,
     usdc_committed = fill_qty * fill_ask
     fee = _polymarket_taker_fee(fill_qty, fill_ask)  # v6.5.5: Polymarket charges this exact fee server-side; we mirror locally for bookkeeping
     return fill_ask, fill_qty, fee, "filled_live"
+
+
+def _bss_place_live_sell(state: BotState, token_id: str,
+                           decision_price: float, qty_shares: float
+                           ) -> Tuple[Optional[float], Optional[float],
+                                      Optional[float], str]:
+    """v6.5.6: place a real FAK SELL order on Polymarket CLOB.
+
+    Mirror of _bss_place_live_fak but for selling held shares. Used by
+    the orphan-sell rule (and TP rule) when running in LIVE mode to
+    actually exit a half-paired position.
+
+    Args:
+      state: BotState (provides clob_client)
+      token_id: the side-token we're selling (leg1's token_id, not the
+                opposite)
+      decision_price: the limit price we'd like (typically leg1_top_bid).
+                       FAK will match against any bid >= this price.
+      qty_shares: number of shares to sell (typically leg1_qty)
+
+    Returns:
+      (fill_price, fill_qty, fee, outcome) where outcome is one of:
+        - "filled_live"   — full requested qty matched
+        - "partial_live"  — some matched, less than full qty
+        - "rejected"      — FAK found no match at or above decision_price
+        - "error"         — exception talking to CLOB
+        - "no_client"     — clob_client not initialized
+
+    Design notes:
+      - FAK only, no GTC fallback. GTC would sit on the orderbook and
+        async-fill at any later price/quantity, breaking our synchronous
+        state machine. Past LIVE evidence (April 2026 scalper3) shows
+        GTC fallback also fails on thin books — small upside, large
+        complexity. If FAK rejects, the position stays HALF and the
+        band-sustain run continues; the rule will retry next tick.
+      - Returns the ACTUAL fill price from the CLOB response, not the
+        decision_price. Caller MUST use this for P&L computation —
+        the actual fill price can be ≥ decision_price (favorable, very
+        rare) or could differ if the orderbook moved during submission.
+    """
+    if state.clob_client is None:
+        print("[bss_orphan_sell][LIVE] clob_client not initialized", flush=True)
+        return None, None, None, "no_client"
+
+    if qty_shares <= 0 or decision_price <= 0:
+        print(f"[bss_orphan_sell][LIVE] invalid args: "
+              f"qty={qty_shares} price={decision_price}", flush=True)
+        return None, None, None, "error"
+
+    try:
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import SELL
+    except ImportError as e:
+        print(f"[bss_orphan_sell][LIVE] py-clob-client import failed: {e}",
+              flush=True)
+        return None, None, None, "error"
+
+    try:
+        order_args = OrderArgs(
+            price=decision_price,
+            size=qty_shares,
+            side=SELL,
+            token_id=token_id,
+        )
+        signed = state.clob_client.create_order(order_args)
+        resp = state.clob_client.post_order(signed, OrderType.FAK)
+    except Exception as e:
+        print(f"[bss_orphan_sell][LIVE] order error: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return None, None, None, "error"
+
+    success = bool(resp and resp.get("success", False))
+    if not success:
+        err = (resp or {}).get("errorMsg") or (resp or {}).get("error") or "rejected"
+        print(f"[bss_orphan_sell][LIVE] FAK rejected: {err} resp={resp}",
+              flush=True)
+        return None, None, None, "rejected"
+
+    fill_price = float(resp.get("price", decision_price))
+    fill_qty = float(resp.get("size_matched", 0.0))
+    if fill_qty <= 0:
+        # Server returned success but matched zero — treat as rejection.
+        print(f"[bss_orphan_sell][LIVE] zero fill on success response: "
+              f"resp={resp}", flush=True)
+        return None, None, None, "rejected"
+
+    fee = _polymarket_taker_fee(fill_qty, fill_price)
+    # Detect partial fill (≥99% match counts as full; floating-point slack)
+    is_partial = fill_qty < qty_shares * 0.99
+    outcome = "partial_live" if is_partial else "filled_live"
+    print(f"[bss_orphan_sell][LIVE] FAK {outcome}: "
+          f"requested {qty_shares:.4f}@{decision_price:.4f}, "
+          f"filled {fill_qty:.4f}@{fill_price:.4f}, "
+          f"fee={fee:.4f}", flush=True)
+    return fill_price, fill_qty, fee, outcome
 
 
 def _bss_place_leg1(state: BotState, mdm: MultiDurationMarket, now: float,
@@ -7310,22 +7511,131 @@ def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                           yes_ask: float, no_ask: float,
                           yes_bid: float, no_bid: float,
                           tp_ratio: Optional[float] = None) -> None:
-    """v6.5.5: execute the orphan-sell action. Logs BSS_ORPHAN_SELL_DRY
+    """v6.5.5/v6.5.6: execute the orphan-sell action.
+
+    v6.5.6: In LIVE mode, this now submits a REAL FAK sell order to the
+    Polymarket CLOB via `_bss_place_live_sell`. Three branches:
+
+      - filled_live  → actual full fill. Use ACTUAL fill price (not the
+                       snapshot caller passed in) for P&L. Update state
+                       to ORPHAN_SOLD, book P&L, log event.
+      - partial_live → some shares matched, less than full. Book P&L for
+                       sold portion proportionally, reduce mdm.bss_leg1_*
+                       to reflect remaining shares, transition state to
+                       ORPHAN_SOLD_PARTIAL. Remaining shares hold to
+                       resolution (no further orphan-sell attempts).
+      - rejected/error/no_client → don't change state, don't update P&L
+                       counter. Log BSS_ORPHAN_SELL_LIVE_FAIL. Position
+                       stays in WAITING_2ND. Band-sustain timestamps
+                       remain valid; rule may fire again next tick.
+
+    v6.5.4/v6.5.5: in DRY mode, no real order. Logs BSS_ORPHAN_SELL_DRY
     (positive-exit) or BSS_ORPHAN_TP_DRY (take-profit) event, updates
     dashboard P&L counter, records to trade history for dashboard
-    last-15-trades display, transitions state to terminal."""
+    last-15-trades display, transitions state to terminal.
+
+    Caller passes (sell_avg_p, qty_sold, sell_fee, sell_pnl_now)
+    computed from the cashout convention as the DESIRED sale. In LIVE
+    these are inputs to the order; the actual fill may differ. In DRY
+    these become the recorded values directly.
+    """
     leg1_side = mdm.bss_first_side
     market = mdm.market
     leg1_entry_ask = mdm.bss_leg1_actual_ask or 0.0
     leg1_size = mdm.bss_leg1_size_usdc or 0.0
     leg1_qty = mdm.bss_leg1_qty or 0.0
+    leg1_fee = mdm.bss_leg1_fee or 0.0
+    token_id = (market.yes_token_id if leg1_side == "YES"
+                else market.no_token_id)
+    is_live = (state.config.mode == "live")
 
-    # Stamp the sell on the mdm for downstream / dashboard visibility
+    # ── v6.5.6: LIVE BRANCH — submit actual FAK SELL order ───────────
+    # In LIVE we attempt the real order BEFORE updating any state. If
+    # the order fails or partially fills, the recorded P&L and state
+    # must reflect what actually happened, not the requested cashout.
+    actual_outcome = sell_outcome  # default: caller's "cashout" tag (DRY)
+    if is_live:
+        live_fill_p, live_fill_qty, live_fee, live_out = (
+            _bss_place_live_sell(
+                state, token_id,
+                decision_price=sell_avg_p, qty_shares=qty_sold,
+            )
+        )
+        if live_out in ("rejected", "error", "no_client"):
+            # Order didn't go through. Don't change state, don't book
+            # P&L, just log the failure so we have a record. The next
+            # shadow tick will re-evaluate the rule; if conditions are
+            # still met (and band-sustain still valid) it will retry.
+            try:
+                event_fail = ("BSS_ORPHAN_TP_LIVE_FAIL"
+                              if reason == "take_profit"
+                              else "BSS_ORPHAN_SELL_LIVE_FAIL")
+                note_fail = (f"src=bss_entry,leg=1,side={leg1_side},"
+                              f"reason={reason},attempted_price={sell_avg_p:.4f},"
+                              f"attempted_qty={qty_sold:.4f},"
+                              f"outcome={live_out},"
+                              f"hold_elapsed={hold_elapsed_s:.1f}s,"
+                              f"ttr={market.end_ts - now:.0f}s")
+                if state.bs_trades_logger is not None:
+                    row = [
+                        int(now * 1000), event_fail,
+                        market.condition_id, market.slug, market.market_url,
+                        f"{market.end_ts:.0f}", leg1_side, token_id,
+                        f"{leg1_entry_ask:.4f}", f"{sell_avg_p:.4f}",
+                        f"{leg1_size:.4f}", f"{qty_sold:.4f}",
+                        "0.0000", "", "0.0000", "0.0000",
+                        state.config.mode, note_fail,
+                    ]
+                    state.bs_trades_logger.log(row)
+            except Exception as e:
+                print(f"[bss_orphan_sell] LIVE fail log error: "
+                      f"{type(e).__name__}: {e}", flush=True)
+            return  # Don't update state, don't book P&L.
+
+        # filled_live or partial_live — recompute everything from ACTUAL
+        # fill data (price and qty), not the caller's snapshot.
+        sell_avg_p = live_fill_p
+        qty_sold = live_fill_qty
+        sell_fee = live_fee
+        actual_outcome = live_out
+
+        # P&L for the SOLD portion only (works for both full and partial).
+        # For partial, the entry-side cost and fee must be proportional
+        # to the fraction sold: cost_sold = leg1_size * (sold/leg1_qty),
+        # entry_fee_sold = leg1_fee * (sold/leg1_qty).
+        if leg1_qty > 0:
+            sold_fraction = min(qty_sold / leg1_qty, 1.0)
+        else:
+            sold_fraction = 1.0
+        cost_sold = leg1_size * sold_fraction
+        entry_fee_sold = leg1_fee * sold_fraction
+        sell_proceeds = qty_sold * sell_avg_p
+        sell_pnl_now = sell_proceeds - sell_fee - cost_sold - entry_fee_sold
+
+    # ── Stamp the sell on the mdm for downstream / dashboard visibility
     mdm.bss_orphan_sold_at = sell_avg_p
     mdm.bss_orphan_sold_ts = now
     mdm.bss_orphan_sold_pnl = sell_pnl_now
     mdm.bss_orphan_sold_reason = reason
-    mdm.bss_state = "ORPHAN_SOLD"
+
+    if actual_outcome == "partial_live":
+        # Some shares remain unsold; they hold to natural market
+        # resolution. Reduce mdm.bss_leg1_* so the resolution flow
+        # settles only the remaining qty, not the original.
+        remaining_qty = leg1_qty - qty_sold
+        remaining_size = leg1_size * (remaining_qty / leg1_qty if leg1_qty > 0 else 0.0)
+        remaining_fee = leg1_fee * (remaining_qty / leg1_qty if leg1_qty > 0 else 0.0)
+        mdm.bss_leg1_qty = remaining_qty
+        mdm.bss_leg1_size_usdc = remaining_size
+        mdm.bss_leg1_fee = remaining_fee
+        # New terminal-ish state. The entry evaluator's terminal-state
+        # list and resolution gate both treat ORPHAN_SOLD_PARTIAL as a
+        # held position awaiting natural settlement (see v6.5.6 entry
+        # evaluator updates).
+        mdm.bss_state = "ORPHAN_SOLD_PARTIAL"
+    else:
+        # Full fill (LIVE) or DRY simulated sell — terminal.
+        mdm.bss_state = "ORPHAN_SOLD"
 
     # Update P&L counter (dashboard reflects this immediately)
     state.bs_pnl_today_usdc += sell_pnl_now
@@ -7333,7 +7643,6 @@ def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
 
     # Log the event
     try:
-        is_live = (state.config.mode == "live")
         if reason == "take_profit":
             event = "BSS_ORPHAN_TP_LIVE" if is_live else "BSS_ORPHAN_TP_DRY"
         else:
@@ -7342,7 +7651,7 @@ def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
         note = (f"src=bss_entry,leg=1,side={leg1_side},reason={reason},"
                 f"entry_ask={leg1_entry_ask:.4f},"
                 f"sold_at={sell_avg_p:.4f},"
-                f"sell_outcome={sell_outcome},"
+                f"sell_outcome={actual_outcome},"
                 f"qty_sold={qty_sold:.4f},"
                 f"sell_fee={sell_fee:.4f},"
                 f"sell_pnl={sell_pnl_now:+.4f},"
@@ -7350,8 +7659,6 @@ def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                 f"bin_adverse_bps={bin_adverse_bps if bin_adverse_bps is None else f'{bin_adverse_bps:+.1f}'},"
                 f"tp_ratio={tp_ratio if tp_ratio is None else f'{tp_ratio:.3f}'},"
                 f"ttr={ttr_s:.0f}s")
-        token_id = (market.yes_token_id if leg1_side == "YES"
-                    else market.no_token_id)
         if state.bs_trades_logger is not None:
             row = [
                 int(now * 1000),
@@ -9830,7 +10137,7 @@ def _print_banner(state: BotState) -> None:
                 if _BS_USE_POLYMARKET_FEE_FORMULA
                 else f"legacy flat {_BS_TAKER_FEE_PCT*100:.1f}%"
             )
-            print(f"  *** DRY MODE v6.5.5.2 — per-leg placement, no abort, "
+            print(f"  *** DRY MODE v6.5.6 — per-leg placement, no abort, "
                   f"book-walk={walk_status} (taker_fee={fee_status}). "
                   f"v6.5.2 entry filter: {ttr_status}. "
                   f"v6.5.3 Tier-1 logging: ring buffer + extra_json + "
@@ -9854,6 +10161,16 @@ def _print_banner(state: BotState) -> None:
                   f"TP uses {_BS_BSS_ORPHAN_TP_SUSTAIN_S:.0f}s sustain / "
                   f"{_BS_BSS_ORPHAN_TP_GRACE_S:.0f}s grace. "
                   f"v6.5.5.2 phase visibility: floor/strict tagged in CSV. "
+                  f"v6.5.5.3 HOTFIX: resolution gate runs BEFORE locked-"
+                  f"spread reject (fixes v6.5.5.2 silent-drop of natural orphans). "
+                  f"v6.5.5.3 dashboard in-flight indicator: WAITING_2ND positions "
+                  f"show orphan-sell sustain progress + would-sell pnl. "
+                  f"v6.5.6 LIVE SELL: orphan-sell now submits real FAK orders "
+                  f"in LIVE mode via _bss_place_live_sell (no GTC fallback). "
+                  f"Partial fills → ORPHAN_SOLD_PARTIAL (proportional P&L, "
+                  f"remaining qty held to resolution). Rejected/error → "
+                  f"BSS_ORPHAN_SELL_LIVE_FAIL logged, state stays WAITING_2ND, "
+                  f"retry next tick. DRY behavior unchanged. "
                   f"v6.5.5 dashboard: last-15 trades with ORPHAN_SOLD render. ***",
                   flush=True)
         # Note v6.4.0 deleted env vars if user still has them set
