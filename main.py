@@ -1,5 +1,5 @@
 """
-main.py — polybot_skuld_v1 (v6.5.6 "Skuld" — LIVE orphan-sell: real CLOB FAK orders for orphan-sell + take-profit rules).
+main.py — polybot_skuld_v1 (v6.5.6.1 "Skuld" — hotfix: fix PolyBook-as-price crash in dashboard in-flight indicator).
 v6.5.1 — applied 2026-05-09.
 
 ═══════════════════════════════════════════════════════════════════════
@@ -241,7 +241,7 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.5.6"
+BOT_VERSION = "6.5.6.1"
 
 
 # v5.6.0: depth + flow observability constants. All used only by new
@@ -3604,8 +3604,14 @@ def _build_status_payload(state: BotState) -> dict:
                 # "this orphan is about to be sold" before it fires.
                 # Computes the same fields the orphan-sell evaluator
                 # uses, without ever firing (read-only snapshot).
+                # v6.5.6.1 HOTFIX: yb/nb are PolyBook OBJECTS, not bid
+                # prices. Extract scalars the same way `ya`/`na` are
+                # derived from `yb.ask`/`nb.ask` earlier in this loop.
+                yes_bid_scalar = float(yb.bid) if yb else 0.0
+                no_bid_scalar = float(nb.bid) if nb else 0.0
                 leg1_side = mdm.bss_first_side
-                leg1_top_bid = ((yb if leg1_side == "YES" else nb)
+                leg1_top_bid = ((yes_bid_scalar if leg1_side == "YES"
+                                  else no_bid_scalar)
                                  if leg1_side else 0.0)
                 leg1_qty = mdm.bss_leg1_qty or 0.0
                 leg1_size = mdm.bss_leg1_size_usdc or 1.0
@@ -3613,7 +3619,7 @@ def _build_status_payload(state: BotState) -> dict:
                 leg1_entry_ask = mdm.bss_leg1_actual_ask or 0.0
 
                 # Current would-sell pnl (cashout convention)
-                if leg1_top_bid and leg1_qty:
+                if leg1_top_bid > 0 and leg1_qty > 0:
                     _sell_fee = _polymarket_taker_fee(
                         leg1_qty, leg1_top_bid)
                     sell_pnl_now = (leg1_qty * leg1_top_bid - _sell_fee
@@ -10137,7 +10143,7 @@ def _print_banner(state: BotState) -> None:
                 if _BS_USE_POLYMARKET_FEE_FORMULA
                 else f"legacy flat {_BS_TAKER_FEE_PCT*100:.1f}%"
             )
-            print(f"  *** DRY MODE v6.5.6 — per-leg placement, no abort, "
+            print(f"  *** DRY MODE v6.5.6.1 — per-leg placement, no abort, "
                   f"book-walk={walk_status} (taker_fee={fee_status}). "
                   f"v6.5.2 entry filter: {ttr_status}. "
                   f"v6.5.3 Tier-1 logging: ring buffer + extra_json + "
@@ -10171,6 +10177,9 @@ def _print_banner(state: BotState) -> None:
                   f"remaining qty held to resolution). Rejected/error → "
                   f"BSS_ORPHAN_SELL_LIVE_FAIL logged, state stays WAITING_2ND, "
                   f"retry next tick. DRY behavior unchanged. "
+                  f"v6.5.6.1 HOTFIX: fixed PolyBook-as-price crash in dashboard "
+                  f"in-flight indicator (/api/data was throwing TypeError on "
+                  f"every poll). "
                   f"v6.5.5 dashboard: last-15 trades with ORPHAN_SOLD render. ***",
                   flush=True)
         # Note v6.4.0 deleted env vars if user still has them set
