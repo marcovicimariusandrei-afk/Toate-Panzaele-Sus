@@ -493,6 +493,10 @@ def _read_v610_env() -> Tuple[
     bs_bss_t_second_floor = _f("BS_BSS_T_SECOND_FLOOR", 0.40, 0.10, 0.50)
     bs_bss_opp_vel_lookback_s = _f("BS_BSS_OPP_VEL_LOOKBACK_S", 10.0, 2.0, 60.0)
     bs_bss_opp_vel_patient_drop = _f("BS_BSS_OPP_VEL_PATIENT_DROP", 0.005, 0.0, 0.5)
+    # v6.5.8: patience drop threshold for LEG1 (same side as entry).
+    # If leg1 side is still falling faster than this per lookback window,
+    # hold one tick — we'll get a better fill. 0 = disabled.
+    bs_bss_leg1_patient_drop = _f("BS_BSS_LEG1_PATIENT_DROP", 0.005, 0.0, 0.5)
 
     # v6.3.2: PRE-MARKET BSS phase. Polymarket creates 5m markets ~30 min
     # before the window opens. Books form, prices wobble, sometimes one
@@ -554,6 +558,7 @@ def _read_v610_env() -> Tuple[
             bs_bss_relax_at_s, bs_bss_abort_at_s,
             bs_bss_btc_vel_filter, bs_bss_btc_vel_lookback_s,
             bs_bss_t_second_floor, bs_bss_opp_vel_lookback_s, bs_bss_opp_vel_patient_drop,
+            bs_bss_leg1_patient_drop,
             bs_bss_t_first_pre, bs_bss_t_second_pre,
             bs_bss_sustain_first_pre_s, bs_bss_sustain_second_pre_s,
             bs_bss_tick_interval_s,
@@ -574,6 +579,7 @@ def _read_v610_env() -> Tuple[
  _BS_BSS_RELAX_AT_S, _BS_BSS_ABORT_AT_S,
  _BS_BSS_BTC_VEL_FILTER_PCT, _BS_BSS_BTC_VEL_LOOKBACK_S,
  _BS_BSS_T_SECOND_FLOOR, _BS_BSS_OPP_VEL_LOOKBACK_S, _BS_BSS_OPP_VEL_PATIENT_DROP,
+ _BS_BSS_LEG1_PATIENT_DROP,
  _BS_BSS_T_FIRST_PRE, _BS_BSS_T_SECOND_PRE,
  _BS_BSS_SUSTAIN_FIRST_PRE_S, _BS_BSS_SUSTAIN_SECOND_PRE_S,
  _BS_BSS_TICK_INTERVAL_S,
@@ -834,6 +840,10 @@ _BS_BSS_ORPHAN_RS_SUSTAIN_S = float(
 )
 _BS_BSS_ORPHAN_RS_GRACE_S = float(
     os.environ.get("BS_BSS_ORPHAN_RS_GRACE_S", "1.5") or "1.5"
+)
+# Only fire RS in the last N seconds — gives position time to recover/pair first
+_BS_BSS_ORPHAN_RS_TTR_MAX_S = float(
+    os.environ.get("BS_BSS_ORPHAN_RS_TTR_MAX_S", "60.0") or "60.0"
 )
 
 
@@ -5232,6 +5242,51 @@ def _opposite_side_drop(mdm, fire_side: str, now: float,
     return old_p - new_p  # positive = falling
 
 
+def _same_side_drop(mdm, fire_side: str, now: float,
+                     lookback_s: float) -> Optional[float]:
+    """v6.5.8: returns the absolute price drop of the SAME side as fire_side
+    over the last `lookback_s` seconds. Used by patient first-leg logic to
+    detect if the leg1 side is still actively falling — if so, wait for a
+    better fill rather than firing immediately at sustain completion.
+
+    Args:
+      mdm        : MultiDurationMarket — has bss_price_samples (1Hz ring buffer)
+      fire_side  : "YES" or "NO" (the side we're about to buy as leg1)
+      now        : current ts
+      lookback_s : how far back to look
+
+    Returns:
+      Absolute drop = price_old - price_new
+      Positive = price has FALLEN (still sliding → wait for better entry)
+      Negative = price has RISEN (stabilised / bounced → safe to fire)
+      None if insufficient samples
+    """
+    samples = list(mdm.bss_price_samples)
+    if len(samples) < 3:
+        return None
+    target_old_ts = now - lookback_s
+    best_old_dt = best_new_dt = float('inf')
+    best_old_yes = best_old_no = None
+    best_new_yes = best_new_no = None
+    for ts, yes_ask, no_ask in samples:
+        dt_old = abs(ts - target_old_ts)
+        if dt_old < best_old_dt and dt_old <= 3.0:
+            best_old_dt = dt_old
+            best_old_yes, best_old_no = yes_ask, no_ask
+        dt_new = abs(ts - now)
+        if dt_new < best_new_dt and dt_new <= 3.0:
+            best_new_dt = dt_new
+            best_new_yes, best_new_no = yes_ask, no_ask
+    if best_old_yes is None or best_new_yes is None:
+        return None
+    # Same side as leg1 — check if it's still falling
+    if fire_side == "YES":
+        old_p, new_p = best_old_yes, best_new_yes
+    else:
+        old_p, new_p = best_old_no, best_new_no
+    return old_p - new_p  # positive = falling
+
+
 def _bs_compute_sell_loser_diagnostics(state: BotState, pos: BothSidesPosition,
                                           now: float) -> str:
     """v6.1.7: build a comma-separated key=value string of diagnostics for
@@ -5965,9 +6020,24 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
                               f"btc_v_30s={btc_v_pct:+.4f}% "
                               f"(moving with side; skip)", flush=True)
                         return
-            # v6.5.0: log the candidate detection for backward compat,
-            # then immediately attempt placement. _bss_place_leg1 handles
-            # state transition (→WAITING_2ND on success, stay WATCH on fail).
+            # v6.5.8: LEG1 PATIENCE CHECK.
+            # If the leg1 side is still actively falling, hold one tick —
+            # we'll get a better entry price (more shares, better wins,
+            # smaller orphan RS loss). Uses same ring-buffer logic as leg2.
+            # Data: 43% of paired trades saw leg1 price drop further after
+            # entry (avg 11.4¢). Better entry at 0.33 vs 0.40 nearly halves
+            # orphan RS loss and adds ~$0.18/win on paired trades.
+            if _BS_BSS_LEG1_PATIENT_DROP > 0:
+                same_drop = _same_side_drop(mdm, fire_side, now,
+                                             _BS_BSS_OPP_VEL_LOOKBACK_S)
+                if (same_drop is not None
+                        and same_drop >= _BS_BSS_LEG1_PATIENT_DROP):
+                    print(f"[bss_entry] FIRST_LEG_PATIENT "
+                          f"market={market.condition_id[:10]}… "
+                          f"side={fire_side} ask={fire_price:.3f} "
+                          f"drop_{int(_BS_BSS_OPP_VEL_LOOKBACK_S)}s={same_drop:+.4f} "
+                          f"(still falling; wait for better entry)", flush=True)
+                    return
             mdm.bss_first_side = fire_side
             mdm.bss_first_price = fire_price
             mdm.bss_first_fill_ts = now
@@ -7544,9 +7614,11 @@ def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
     # No TTR cap: data shows winner crosses 0.70 avg 30s into market,
     # well before any time-based exit would help.
     if _BS_BSS_ORPHAN_RS_ENABLED:
+        ttr_s_rs = market.end_ts - now
         winner_ask_now = no_ask if leg1_side == "YES" else yes_ask
         rs_condition = (
             winner_ask_now >= _BS_BSS_ORPHAN_RS_WINNER_THRESHOLD
+            and ttr_s_rs <= _BS_BSS_ORPHAN_RS_TTR_MAX_S
             and leg1_top_bid > 0
         )
         qualified_now_rs, run_duration_s_rs = _bs_update_band_sustain(
@@ -10207,12 +10279,19 @@ def _print_banner(state: BotState) -> None:
             )
             rs_status = (
                 f"ENABLED (winner>={_BS_BSS_ORPHAN_RS_WINNER_THRESHOLD:.2f}, "
+                f"ttr<={_BS_BSS_ORPHAN_RS_TTR_MAX_S:.0f}s, "
                 f"sustain={_BS_BSS_ORPHAN_RS_SUSTAIN_S:.0f}s, "
                 f"grace={_BS_BSS_ORPHAN_RS_GRACE_S:.1f}s)"
                 if _BS_BSS_ORPHAN_RS_ENABLED
                 else "DISABLED (flip BS_BSS_ORPHAN_RS_ENABLED=true to activate)"
             )
-            print(f"  *** DRY MODE v6.5.7 — per-leg placement, no abort, "
+            leg1_pat_status = (
+                f"ON drop>={_BS_BSS_LEG1_PATIENT_DROP:.4f} "
+                f"over {_BS_BSS_OPP_VEL_LOOKBACK_S:.0f}s"
+                if _BS_BSS_LEG1_PATIENT_DROP > 0
+                else "OFF (BS_BSS_LEG1_PATIENT_DROP=0)"
+            )
+            print(f"  *** DRY MODE v6.5.8 — per-leg placement, no abort, "
                   f"book-walk={walk_status} (taker_fee={fee_status}). "
                   f"v6.5.2 entry filter: {ttr_status}. "
                   f"v6.5.3 Tier-1 logging: ring buffer + extra_json + "
@@ -10249,9 +10328,14 @@ def _print_banner(state: BotState) -> None:
                   f"v6.5.6.1 HOTFIX: fixed PolyBook-as-price crash in dashboard. "
                   f"v6.5.7 reverse-sniper cashout (Rule C): {rs_status}. "
                   f"Fires when winner_ask>={_BS_BSS_ORPHAN_RS_WINNER_THRESHOLD:.2f} "
-                  f"(loser leg dead — already below T_SECOND_FLOOR at that point); "
-                  f"sells losing orphan leg at cashout bid to recover ~$0.27 avg "
-                  f"vs full -$1.02 loss. No TTR cap. reason=reverse_sniper in CSV. "
+                  f"AND ttr<={_BS_BSS_ORPHAN_RS_TTR_MAX_S:.0f}s; sells losing orphan "
+                  f"leg at cashout bid (~$0.27 avg recovery vs full -$1.02 loss). "
+                  f"reason=reverse_sniper in CSV. "
+                  f"v6.5.8 leg1-patience: {leg1_pat_status}. "
+                  f"Holds leg1 fire when same-side ask still falling fast — "
+                  f"yields deeper entry (avg 11c better in 43pct of paired trades), "
+                  f"more shares, better wins, smaller orphan RS losses. "
+                  f"FIRST_LEG_PATIENT logged when held. "
                   f"v6.5.5 dashboard: last-15 trades with ORPHAN_SOLD render. ***",
                   flush=True)
         # Note v6.4.0 deleted env vars if user still has them set
