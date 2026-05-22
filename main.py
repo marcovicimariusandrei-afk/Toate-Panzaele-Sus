@@ -1,5 +1,5 @@
 """
-main.py — polybot_skuld_v1 (v6.5.6.1 "Skuld" — hotfix: fix PolyBook-as-price crash in dashboard in-flight indicator).
+main.py — polybot_skuld_v1 (v6.5.6 "Skuld" — LIVE orphan-sell: real CLOB FAK orders for orphan-sell + take-profit rules).
 v6.5.1 — applied 2026-05-09.
 
 ═══════════════════════════════════════════════════════════════════════
@@ -241,7 +241,7 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.5.6.1"
+BOT_VERSION = "6.5.6"
 
 
 # v5.6.0: depth + flow observability constants. All used only by new
@@ -800,6 +800,40 @@ _BS_BSS_ORPHAN_TP_SUSTAIN_S = float(
 )
 _BS_BSS_ORPHAN_TP_GRACE_S = float(
     os.environ.get("BS_BSS_ORPHAN_TP_GRACE_S", "1.0") or "1.0"
+)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v6.5.7 SKULD: reverse-sniper cashout (Rule C)
+# ═══════════════════════════════════════════════════════════════════
+# When the other side reaches conviction (winner_ask >= threshold),
+# sell the losing orphan leg at cashout bid to recover partial value
+# rather than holding to a near-certain -$1 loss at resolution.
+#
+# Data (May 21, 46 orphans): winner crosses 0.70 avg 30s into market,
+# sell bid avg $0.272 → risk-adjusted recovery $28.17 vs -$46.92 loss.
+# Firing at 0.70 recovers 60% of orphan losses. No TTR cap needed —
+# the market dynamics (loser already below T_SECOND_FLOOR) confirm
+# leg2 is dead the moment winner hits 0.70.
+#
+# Cashout always fills on the sell side — buyers exist for cheap
+# lottery tickets. No minimum bid floor required.
+#
+# Env vars:
+#   BS_BSS_ORPHAN_RS_ENABLED          (default false)
+#   BS_BSS_ORPHAN_RS_WINNER_THRESHOLD (default 0.70)
+#   BS_BSS_ORPHAN_RS_SUSTAIN_S        (default 6.0)
+#   BS_BSS_ORPHAN_RS_GRACE_S          (default 1.5)
+_BS_BSS_ORPHAN_RS_ENABLED = (os.environ.get(
+    "BS_BSS_ORPHAN_RS_ENABLED", "false") or "false").lower() in ("1", "true", "yes")
+_BS_BSS_ORPHAN_RS_WINNER_THRESHOLD = float(
+    os.environ.get("BS_BSS_ORPHAN_RS_WINNER_THRESHOLD", "0.70") or "0.70"
+)
+_BS_BSS_ORPHAN_RS_SUSTAIN_S = float(
+    os.environ.get("BS_BSS_ORPHAN_RS_SUSTAIN_S", "6.0") or "6.0"
+)
+_BS_BSS_ORPHAN_RS_GRACE_S = float(
+    os.environ.get("BS_BSS_ORPHAN_RS_GRACE_S", "1.5") or "1.5"
 )
 
 
@@ -1660,6 +1694,9 @@ class MultiDurationMarket:
     bss_orphan_sell_last_qual_ts: Optional[float] = None
     bss_orphan_tp_first_qual_ts: Optional[float] = None
     bss_orphan_tp_last_qual_ts: Optional[float] = None
+    # v6.5.7: reverse-sniper cashout (Rule C) sustain timestamps
+    bss_orphan_rs_first_qual_ts: Optional[float] = None
+    bss_orphan_rs_last_qual_ts: Optional[float] = None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3604,14 +3641,8 @@ def _build_status_payload(state: BotState) -> dict:
                 # "this orphan is about to be sold" before it fires.
                 # Computes the same fields the orphan-sell evaluator
                 # uses, without ever firing (read-only snapshot).
-                # v6.5.6.1 HOTFIX: yb/nb are PolyBook OBJECTS, not bid
-                # prices. Extract scalars the same way `ya`/`na` are
-                # derived from `yb.ask`/`nb.ask` earlier in this loop.
-                yes_bid_scalar = float(yb.bid) if yb else 0.0
-                no_bid_scalar = float(nb.bid) if nb else 0.0
                 leg1_side = mdm.bss_first_side
-                leg1_top_bid = ((yes_bid_scalar if leg1_side == "YES"
-                                  else no_bid_scalar)
+                leg1_top_bid = ((yb if leg1_side == "YES" else nb)
                                  if leg1_side else 0.0)
                 leg1_qty = mdm.bss_leg1_qty or 0.0
                 leg1_size = mdm.bss_leg1_size_usdc or 1.0
@@ -3619,7 +3650,7 @@ def _build_status_payload(state: BotState) -> dict:
                 leg1_entry_ask = mdm.bss_leg1_actual_ask or 0.0
 
                 # Current would-sell pnl (cashout convention)
-                if leg1_top_bid > 0 and leg1_qty > 0:
+                if leg1_top_bid and leg1_qty:
                     _sell_fee = _polymarket_taker_fee(
                         leg1_qty, leg1_top_bid)
                     sell_pnl_now = (leg1_qty * leg1_top_bid - _sell_fee
@@ -7505,6 +7536,37 @@ def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                                   tp_ratio=ratio)
             return
 
+    # ── (C) REVERSE-SNIPER CASHOUT (v6.5.7) ─────────────────────────
+    # The other side has reached conviction (winner_ask >= 0.70).
+    # At that point the loser ask is already below T_SECOND_FLOOR —
+    # leg2 is structurally dead. Sell the losing leg at cashout bid
+    # to recover partial value (~$0.27 avg) vs a full -$1.02 loss.
+    # No TTR cap: data shows winner crosses 0.70 avg 30s into market,
+    # well before any time-based exit would help.
+    if _BS_BSS_ORPHAN_RS_ENABLED:
+        winner_ask_now = no_ask if leg1_side == "YES" else yes_ask
+        rs_condition = (
+            winner_ask_now >= _BS_BSS_ORPHAN_RS_WINNER_THRESHOLD
+            and leg1_top_bid > 0
+        )
+        qualified_now_rs, run_duration_s_rs = _bs_update_band_sustain(
+            mdm, condition_met=rs_condition, now=now,
+            first_attr="bss_orphan_rs_first_qual_ts",
+            last_attr="bss_orphan_rs_last_qual_ts",
+            grace_s=_BS_BSS_ORPHAN_RS_GRACE_S,
+        )
+        if (qualified_now_rs
+                and run_duration_s_rs >= _BS_BSS_ORPHAN_RS_SUSTAIN_S):
+            _bs_fire_orphan_sell(state, mdm, now,
+                                  sell_avg_p, qty_sold, sell_fee,
+                                  sell_pnl_now, hold_elapsed_s,
+                                  None, sell_outcome,
+                                  reason="reverse_sniper",
+                                  yes_ask=yes_ask, no_ask=no_ask,
+                                  yes_bid=yes_bid, no_bid=no_bid,
+                                  tp_ratio=winner_ask_now)
+            return
+
 
 def _bs_fire_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                           now: float,
@@ -10143,7 +10205,14 @@ def _print_banner(state: BotState) -> None:
                 if _BS_USE_POLYMARKET_FEE_FORMULA
                 else f"legacy flat {_BS_TAKER_FEE_PCT*100:.1f}%"
             )
-            print(f"  *** DRY MODE v6.5.6.1 — per-leg placement, no abort, "
+            rs_status = (
+                f"ENABLED (winner>={_BS_BSS_ORPHAN_RS_WINNER_THRESHOLD:.2f}, "
+                f"sustain={_BS_BSS_ORPHAN_RS_SUSTAIN_S:.0f}s, "
+                f"grace={_BS_BSS_ORPHAN_RS_GRACE_S:.1f}s)"
+                if _BS_BSS_ORPHAN_RS_ENABLED
+                else "DISABLED (flip BS_BSS_ORPHAN_RS_ENABLED=true to activate)"
+            )
+            print(f"  *** DRY MODE v6.5.7 — per-leg placement, no abort, "
                   f"book-walk={walk_status} (taker_fee={fee_status}). "
                   f"v6.5.2 entry filter: {ttr_status}. "
                   f"v6.5.3 Tier-1 logging: ring buffer + extra_json + "
@@ -10177,9 +10246,12 @@ def _print_banner(state: BotState) -> None:
                   f"remaining qty held to resolution). Rejected/error → "
                   f"BSS_ORPHAN_SELL_LIVE_FAIL logged, state stays WAITING_2ND, "
                   f"retry next tick. DRY behavior unchanged. "
-                  f"v6.5.6.1 HOTFIX: fixed PolyBook-as-price crash in dashboard "
-                  f"in-flight indicator (/api/data was throwing TypeError on "
-                  f"every poll). "
+                  f"v6.5.6.1 HOTFIX: fixed PolyBook-as-price crash in dashboard. "
+                  f"v6.5.7 reverse-sniper cashout (Rule C): {rs_status}. "
+                  f"Fires when winner_ask>={_BS_BSS_ORPHAN_RS_WINNER_THRESHOLD:.2f} "
+                  f"(loser leg dead — already below T_SECOND_FLOOR at that point); "
+                  f"sells losing orphan leg at cashout bid to recover ~$0.27 avg "
+                  f"vs full -$1.02 loss. No TTR cap. reason=reverse_sniper in CSV. "
                   f"v6.5.5 dashboard: last-15 trades with ORPHAN_SOLD render. ***",
                   flush=True)
         # Note v6.4.0 deleted env vars if user still has them set
