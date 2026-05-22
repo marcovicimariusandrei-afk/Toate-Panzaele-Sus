@@ -3652,7 +3652,7 @@ def _build_status_payload(state: BotState) -> dict:
                 # Computes the same fields the orphan-sell evaluator
                 # uses, without ever firing (read-only snapshot).
                 leg1_side = mdm.bss_first_side
-                leg1_top_bid = ((yb if leg1_side == "YES" else nb)
+                leg1_top_bid = (float((yb if leg1_side == "YES" else nb).bid)
                                  if leg1_side else 0.0)
                 leg1_qty = mdm.bss_leg1_qty or 0.0
                 leg1_size = mdm.bss_leg1_size_usdc or 1.0
