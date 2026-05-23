@@ -241,7 +241,7 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.5.6"
+BOT_VERSION = "6.5.9"
 
 
 # v5.6.0: depth + flow observability constants. All used only by new
@@ -844,6 +844,21 @@ _BS_BSS_ORPHAN_RS_GRACE_S = float(
 # Only fire RS in the last N seconds — gives position time to recover/pair first
 _BS_BSS_ORPHAN_RS_TTR_MAX_S = float(
     os.environ.get("BS_BSS_ORPHAN_RS_TTR_MAX_S", "60.0") or "60.0"
+)
+# v6.5.9: minimum hold time before RS can fire. Data shows 84% of early cheap
+# entries (loser@0.29-0.34) recover to PE-profitable within 60-120s — firing RS
+# in the first 90s destroys those recoveries. Same floor as PE min_elapsed.
+_BS_BSS_ORPHAN_RS_MIN_ELAPSED_S = float(
+    os.environ.get("BS_BSS_ORPHAN_RS_MIN_ELAPSED_S", "90.0") or "90.0"
+)
+# v6.5.9: when TTR > this threshold, require sell_pnl > BS_BSS_PE_HIGH_BAR_PNL
+# before PE fires. Data shows 79% of early PE fires (TTR>120s) would have
+# paired or recovered to better P&L if given more time.
+_BS_BSS_PE_HIGH_BAR_TTR_S = float(
+    os.environ.get("BS_BSS_PE_HIGH_BAR_TTR_S", "120.0") or "120.0"
+)
+_BS_BSS_PE_HIGH_BAR_PNL = float(
+    os.environ.get("BS_BSS_PE_HIGH_BAR_PNL", "0.15") or "0.15"
 )
 
 
@@ -2963,7 +2978,14 @@ main{padding:20px;max-width:1100px;margin:0 auto;}
 <div class="logs-title"><span>CSV logs</span><span id="logs-meta" style="color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0"></span></div>
 <div class="logs-list" id="logs-list"><div class="trades-empty">loading…</div></div>
 </div>
-<div class="footer">Polling /api/status every 1s · <a href="/api/status" target="_blank" style="color:var(--blue)">view JSON</a> · <a href="/api/datasets" target="_blank" style="color:var(--blue)">view datasets JSON</a></div>
+<div class="footer" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+<span>Polling /api/status every 1s · <a href="/api/status" target="_blank" style="color:var(--blue)">view JSON</a> · <a href="/api/datasets" target="_blank" style="color:var(--blue)">view datasets JSON</a></span>
+<span style="display:flex;align-items:center;gap:10px;">
+<span id="vol-usage" style="color:var(--muted);font-size:11px"></span>
+<button id="wipe-btn" onclick="wipeVolume()" style="background:#c0392b;color:#fff;border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;font-family:inherit;">Wipe old CSVs</button>
+<span id="wipe-status" style="font-size:11px;color:var(--muted)"></span>
+</span>
+</div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
@@ -2977,12 +2999,13 @@ const d=await r.json();
 const files=d.files||[];
 const stats=d.writer_stats||{};
 const list=$('logs-list');
-if(!files.length){list.innerHTML='<div class="trades-empty">no log files yet</div>';$('logs-meta').textContent='';return;}
-let totalRows=0;
+if(!files.length){list.innerHTML='<div class="trades-empty">no log files yet</div>';$('logs-meta').textContent='';updateVolUsage(files);return;}
+let totalRows=0,totalBytes=0;
 const rowsHtml=files.map(f=>{
 const wstats=stats[f.dataset]||{};
 const rows=wstats.rows_written;
 if(rows!=null)totalRows+=rows;
+if(f.size_bytes)totalBytes+=f.size_bytes;
 return `<div class="log-row">`
 +`<span class="log-dataset">${f.dataset}</span>`
 +`<span class="log-date">${f.date}</span>`
@@ -2993,7 +3016,37 @@ return `<div class="log-row">`
 }).join('');
 list.innerHTML=rowsHtml;
 $('logs-meta').textContent=files.length+' file'+(files.length===1?'':'s')+(totalRows?' · '+totalRows.toLocaleString()+' rows total':'');
+// Update volume usage display
+const today=new Date().toISOString().slice(0,10);
+const oldFiles=files.filter(f=>f.date&&f.date<today);
+const oldBytes=oldFiles.reduce((s,f)=>s+(f.size_bytes||0),0);
+const volEl=$('vol-usage');
+if(volEl)volEl.textContent=fmtBytes(totalBytes)+' total'+(oldBytes>0?' · '+fmtBytes(oldBytes)+' old':'');
 }catch(e){$('logs-list').innerHTML='<div class="trades-empty">error loading logs list</div>';}
+}
+async function wipeVolume(){
+const btn=$('wipe-btn');const st=$('wipe-status');
+// Preview first
+const prev=await fetch('/api/cleanup',{cache:'no-store'});
+const prevData=await prev.json();
+const toDelete=prevData.would_delete||[];
+if(!toDelete.length){st.textContent='Nothing to wipe (no old files)';st.style.color='var(--muted)';return;}
+if(!confirm('Delete '+toDelete.length+' old CSV file(s)?\n\n'+toDelete.join('\n'))){st.textContent='Cancelled';return;}
+btn.disabled=true;st.textContent='Wiping…';st.style.color='var(--muted)';
+try{
+const r=await fetch('/api/cleanup?confirm=true',{cache:'no-store'});
+const d=await r.json();
+if(d.deleted&&d.deleted.length){
+  st.textContent='Deleted '+d.deleted.length+' file(s)';st.style.color='#2ecc71';
+}else if(d.errors&&d.errors.length){
+  st.textContent='Error: '+d.errors[0];st.style.color='#e74c3c';
+}else{
+  st.textContent='Nothing deleted';st.style.color='var(--muted)';
+}
+}catch(e){st.textContent='Request failed';st.style.color='#e74c3c';}
+btn.disabled=false;
+setTimeout(()=>{st.textContent='';},8000);
+tickDatasets();
 }
 async function tick(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw 0;const s=await r.json();render(s);}catch(e){$('uptime').textContent='connection lost';}}
 function render(s){
@@ -3652,8 +3705,10 @@ def _build_status_payload(state: BotState) -> dict:
                 # Computes the same fields the orphan-sell evaluator
                 # uses, without ever firing (read-only snapshot).
                 leg1_side = mdm.bss_first_side
-                leg1_top_bid = (float((yb if leg1_side == "YES" else nb).bid)
-                                 if leg1_side else 0.0)
+                leg1_book = ((yb if leg1_side == "YES" else nb)
+                              if leg1_side else None)
+                leg1_top_bid = (float(leg1_book.bid)
+                                if leg1_book is not None else 0.0)
                 leg1_qty = mdm.bss_leg1_qty or 0.0
                 leg1_size = mdm.bss_leg1_size_usdc or 1.0
                 leg1_fee_paid = mdm.bss_leg1_fee or 0.0
@@ -7562,6 +7617,13 @@ def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                 sell_pnl_now >= _BS_BSS_ORPHAN_SELL_MIN_PNL
                 and hold_elapsed_s >= _BS_BSS_ORPHAN_SELL_MIN_ELAPSED_S
                 and bin_adverse_bps >= _BS_BSS_ORPHAN_SELL_MIN_ADVERSE_BPS
+                # v6.5.9: when significant TTR remains, require higher P&L bar.
+                # Data: 79% of PE fires with TTR>120s would have paired or
+                # recovered to better P&L if held. Require $0.15 min when
+                # time remains to avoid leaving paired-trade value on the table.
+                and (market.end_ts - now > _BS_BSS_PE_HIGH_BAR_TTR_S
+                     and sell_pnl_now >= _BS_BSS_PE_HIGH_BAR_PNL
+                     or market.end_ts - now <= _BS_BSS_PE_HIGH_BAR_TTR_S)
             )
             qualified_now, run_duration_s = _bs_update_band_sustain(
                 mdm, condition_met=pe_conditions, now=now,
@@ -7606,18 +7668,20 @@ def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                                   tp_ratio=ratio)
             return
 
-    # ── (C) REVERSE-SNIPER CASHOUT (v6.5.7) ─────────────────────────
+    # ── (C) REVERSE-SNIPER CASHOUT (v6.5.7 / guard v6.5.9) ──────────
     # The other side has reached conviction (winner_ask >= 0.70).
     # At that point the loser ask is already below T_SECOND_FLOOR —
     # leg2 is structurally dead. Sell the losing leg at cashout bid
     # to recover partial value (~$0.27 avg) vs a full -$1.02 loss.
-    # No TTR cap: data shows winner crosses 0.70 avg 30s into market,
-    # well before any time-based exit would help.
+    # v6.5.9: min hold guard (90s) — data shows 84% of early cheap
+    # entries recover to PE-profitable within 60-120s; without the
+    # guard RS fires at avg 49s and destroys those recoveries.
     if _BS_BSS_ORPHAN_RS_ENABLED:
         ttr_s_rs = market.end_ts - now
         winner_ask_now = no_ask if leg1_side == "YES" else yes_ask
         rs_condition = (
             winner_ask_now >= _BS_BSS_ORPHAN_RS_WINNER_THRESHOLD
+            and hold_elapsed_s >= _BS_BSS_ORPHAN_RS_MIN_ELAPSED_S
             and ttr_s_rs <= _BS_BSS_ORPHAN_RS_TTR_MAX_S
             and leg1_top_bid > 0
         )
