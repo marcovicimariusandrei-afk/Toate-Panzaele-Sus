@@ -241,7 +241,7 @@ _SIGNAL_INVERT = os.environ.get("SIGNAL_INVERT", "false").strip().lower() in ("1
 # v5.7.0: single source of truth for the bot's version string. Used in the
 # boot banner, /api/status payload, and dashboard header so all three stay
 # in sync. Bump this on every release.
-BOT_VERSION = "6.5.9"
+BOT_VERSION = "6.5.10"
 
 
 # v5.6.0: depth + flow observability constants. All used only by new
@@ -850,6 +850,36 @@ _BS_BSS_ORPHAN_RS_TTR_MAX_S = float(
 # in the first 90s destroys those recoveries. Same floor as PE min_elapsed.
 _BS_BSS_ORPHAN_RS_MIN_ELAPSED_S = float(
     os.environ.get("BS_BSS_ORPHAN_RS_MIN_ELAPSED_S", "90.0") or "90.0"
+)
+# v6.5.10: TIERED adaptive RS — built from 820-market depth×BTC analysis.
+# Below winner=0.90: 20-40% natural recovery → never sell (hold for PE/leg2).
+# winner>=0.90 + TTR<120s: 82-93% full loss → sell to recover loser bid.
+# winner>=0.95 at any TTR: 96-100% full loss → sell immediately.
+# BTC guard: falling BTC cuts full-loss rate from 82% → 43% → suppress RS.
+#
+# Tier 1: fire when winner >= this, regardless of TTR (no recovery possible)
+_BS_BSS_ORPHAN_RS_TIER1_WIN = float(
+    os.environ.get("BS_BSS_ORPHAN_RS_TIER1_WIN", "0.95") or "0.95"
+)
+# Tier 2: fire when winner >= this AND TTR <= tier2_ttr_s
+_BS_BSS_ORPHAN_RS_TIER2_WIN = float(
+    os.environ.get("BS_BSS_ORPHAN_RS_TIER2_WIN", "0.92") or "0.92"
+)
+_BS_BSS_ORPHAN_RS_TIER2_TTR_S = float(
+    os.environ.get("BS_BSS_ORPHAN_RS_TIER2_TTR_S", "120.0") or "120.0"
+)
+# Tier 3: fire when winner >= this AND TTR <= tier3_ttr_s
+_BS_BSS_ORPHAN_RS_TIER3_WIN = float(
+    os.environ.get("BS_BSS_ORPHAN_RS_TIER3_WIN", "0.90") or "0.90"
+)
+_BS_BSS_ORPHAN_RS_TIER3_TTR_S = float(
+    os.environ.get("BS_BSS_ORPHAN_RS_TIER3_TTR_S", "120.0") or "120.0"
+)
+# BTC guard: suppress RS when BTC has fallen > X USD in the last 60s.
+# Falling BTC on a YES-up orphan signals potential reversal — hold instead.
+# Set to 0 to disable the guard.
+_BS_BSS_ORPHAN_RS_BTC_GUARD_USD = float(
+    os.environ.get("BS_BSS_ORPHAN_RS_BTC_GUARD_USD", "5.0") or "5.0"
 )
 # v6.5.9: when TTR > this threshold, require sell_pnl > BS_BSS_PE_HIGH_BAR_PNL
 # before PE fires. Data shows 79% of early PE fires (TTR>120s) would have
@@ -7668,22 +7698,57 @@ def _bs_evaluate_orphan_sell(state: "BotState", mdm: "MultiDurationMarket",
                                   tp_ratio=ratio)
             return
 
-    # ── (C) REVERSE-SNIPER CASHOUT (v6.5.7 / guard v6.5.9) ──────────
-    # The other side has reached conviction (winner_ask >= 0.70).
-    # At that point the loser ask is already below T_SECOND_FLOOR —
-    # leg2 is structurally dead. Sell the losing leg at cashout bid
-    # to recover partial value (~$0.27 avg) vs a full -$1.02 loss.
-    # v6.5.9: min hold guard (90s) — data shows 84% of early cheap
-    # entries recover to PE-profitable within 60-120s; without the
-    # guard RS fires at avg 49s and destroys those recoveries.
+    # ── (C) REVERSE-SNIPER CASHOUT (v6.5.7 / tiered v6.5.10) ────────
+    # Tiered adaptive exit: only sell when depth+TTR data shows full-loss
+    # probability is high enough to justify early exit over natural recovery.
+    # 820-market analysis: below winner=0.90 recovery is 20-40% — never sell.
+    # At winner>=0.90+TTR<120s: 82-93% full loss — sell to recover loser bid.
+    # At winner>=0.95 any TTR: 96-100% full loss — sell immediately.
+    # BTC guard: BTC falling >$5/60s cuts full-loss from 82%→43% → hold.
     if _BS_BSS_ORPHAN_RS_ENABLED:
         ttr_s_rs = market.end_ts - now
         winner_ask_now = no_ask if leg1_side == "YES" else yes_ask
+
+        # BTC 60s delta — suppress RS if BTC moving in recovery direction
+        _rs_btc_delta = 0.0
+        try:
+            if state.binance_prices and len(state.binance_prices) >= 2:
+                _bp = list(state.binance_prices)
+                _price_now = _bp[-1][1]
+                _ts_now_ms = _bp[-1][0]
+                _price_60s = next(
+                    (p for ts, p in reversed(_bp)
+                     if _ts_now_ms - ts >= 60_000), _bp[0][1]
+                )
+                _rs_btc_raw = _price_now - _price_60s
+                # sign: positive = BTC rising, negative = BTC falling
+                # For YES-up orphan: if leg1=NO and BTC is falling → good for NO
+                # For NO-up orphan: if leg1=YES and BTC is rising → good for YES
+                if leg1_side == "NO":   # we hold NO, winner=YES
+                    _rs_btc_delta = -_rs_btc_raw  # falling BTC helps NO
+                else:                   # we hold YES, winner=NO
+                    _rs_btc_delta = _rs_btc_raw   # rising BTC helps YES
+        except Exception:
+            pass
+
+        # BTC guard: if BTC is moving favourably for our position, hold
+        _btc_recovery_signal = (
+            _BS_BSS_ORPHAN_RS_BTC_GUARD_USD > 0
+            and _rs_btc_delta > _BS_BSS_ORPHAN_RS_BTC_GUARD_USD
+        )
+
+        # Tiered condition: Tier1 (any TTR), Tier2, Tier3 (TTR-gated)
         rs_condition = (
-            winner_ask_now >= _BS_BSS_ORPHAN_RS_WINNER_THRESHOLD
-            and hold_elapsed_s >= _BS_BSS_ORPHAN_RS_MIN_ELAPSED_S
-            and ttr_s_rs <= _BS_BSS_ORPHAN_RS_TTR_MAX_S
+            hold_elapsed_s >= _BS_BSS_ORPHAN_RS_MIN_ELAPSED_S
             and leg1_top_bid > 0
+            and not _btc_recovery_signal
+            and (
+                winner_ask_now >= _BS_BSS_ORPHAN_RS_TIER1_WIN
+                or (winner_ask_now >= _BS_BSS_ORPHAN_RS_TIER2_WIN
+                    and ttr_s_rs <= _BS_BSS_ORPHAN_RS_TIER2_TTR_S)
+                or (winner_ask_now >= _BS_BSS_ORPHAN_RS_TIER3_WIN
+                    and ttr_s_rs <= _BS_BSS_ORPHAN_RS_TIER3_TTR_S)
+            )
         )
         qualified_now_rs, run_duration_s_rs = _bs_update_band_sustain(
             mdm, condition_met=rs_condition, now=now,
@@ -10342,10 +10407,12 @@ def _print_banner(state: BotState) -> None:
                 else f"legacy flat {_BS_TAKER_FEE_PCT*100:.1f}%"
             )
             rs_status = (
-                f"ENABLED (winner>={_BS_BSS_ORPHAN_RS_WINNER_THRESHOLD:.2f}, "
-                f"ttr<={_BS_BSS_ORPHAN_RS_TTR_MAX_S:.0f}s, "
-                f"sustain={_BS_BSS_ORPHAN_RS_SUSTAIN_S:.0f}s, "
-                f"grace={_BS_BSS_ORPHAN_RS_GRACE_S:.1f}s)"
+                f"ENABLED tiered v6.5.10: "
+                f"T1≥{_BS_BSS_ORPHAN_RS_TIER1_WIN:.2f}(any TTR) | "
+                f"T2≥{_BS_BSS_ORPHAN_RS_TIER2_WIN:.2f}+TTR≤{_BS_BSS_ORPHAN_RS_TIER2_TTR_S:.0f}s | "
+                f"T3≥{_BS_BSS_ORPHAN_RS_TIER3_WIN:.2f}+TTR≤{_BS_BSS_ORPHAN_RS_TIER3_TTR_S:.0f}s | "
+                f"hold≥{_BS_BSS_ORPHAN_RS_MIN_ELAPSED_S:.0f}s | "
+                f"btc_guard=${_BS_BSS_ORPHAN_RS_BTC_GUARD_USD:.0f}"
                 if _BS_BSS_ORPHAN_RS_ENABLED
                 else "DISABLED (flip BS_BSS_ORPHAN_RS_ENABLED=true to activate)"
             )
