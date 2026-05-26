@@ -497,6 +497,11 @@ def _read_v610_env() -> Tuple[
     # If leg1 side is still falling faster than this per lookback window,
     # hold one tick — we'll get a better fill. 0 = disabled.
     bs_bss_leg1_patient_drop = _f("BS_BSS_LEG1_PATIENT_DROP", 0.005, 0.0, 0.5)
+    # v6.5.11: max allowed bounce above the running low seen during the
+    # leg1 sustain streak. If fire_price > streak_low + this → wait.
+    # Prevents buying at $0.33 when the streak low was $0.30.
+    # 0 = disabled (fire on any bounce, legacy behaviour).
+    bs_bss_leg1_max_bounce = _f("BS_BSS_LEG1_MAX_BOUNCE", 0.02, 0.0, 0.5)
 
     # v6.3.2: PRE-MARKET BSS phase. Polymarket creates 5m markets ~30 min
     # before the window opens. Books form, prices wobble, sometimes one
@@ -559,6 +564,7 @@ def _read_v610_env() -> Tuple[
             bs_bss_btc_vel_filter, bs_bss_btc_vel_lookback_s,
             bs_bss_t_second_floor, bs_bss_opp_vel_lookback_s, bs_bss_opp_vel_patient_drop,
             bs_bss_leg1_patient_drop,
+            bs_bss_leg1_max_bounce,
             bs_bss_t_first_pre, bs_bss_t_second_pre,
             bs_bss_sustain_first_pre_s, bs_bss_sustain_second_pre_s,
             bs_bss_tick_interval_s,
@@ -580,6 +586,7 @@ def _read_v610_env() -> Tuple[
  _BS_BSS_BTC_VEL_FILTER_PCT, _BS_BSS_BTC_VEL_LOOKBACK_S,
  _BS_BSS_T_SECOND_FLOOR, _BS_BSS_OPP_VEL_LOOKBACK_S, _BS_BSS_OPP_VEL_PATIENT_DROP,
  _BS_BSS_LEG1_PATIENT_DROP,
+ _BS_BSS_LEG1_MAX_BOUNCE,
  _BS_BSS_T_FIRST_PRE, _BS_BSS_T_SECOND_PRE,
  _BS_BSS_SUSTAIN_FIRST_PRE_S, _BS_BSS_SUSTAIN_SECOND_PRE_S,
  _BS_BSS_TICK_INTERVAL_S,
@@ -1657,6 +1664,8 @@ class MultiDurationMarket:
     bss_state: str = "WATCH"
     bss_yes_below_first_start_ts: Optional[float] = None
     bss_no_below_first_start_ts: Optional[float] = None
+    bss_yes_leg1_low: Optional[float] = None   # v6.5.11: running min YES ask during WATCH streak
+    bss_no_leg1_low:  Optional[float] = None   # v6.5.11: running min NO ask during WATCH streak
     bss_first_side: Optional[str] = None
     bss_first_price: Optional[float] = None         # decision-time ask (legacy field — kept)
     bss_first_fill_ts: Optional[float] = None
@@ -6054,6 +6063,7 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
         if yes_ask < t_first:
             if getattr(mdm, yes_st_field) is None:
                 setattr(mdm, yes_st_field, now)
+                mdm.bss_yes_leg1_low = yes_ask  # v6.5.11: init low at streak start
                 # v6.5.3: log candidate detection (streak start). Selection-
                 # bias fix: gives analysis the "could have fired" population
                 # vs only the "did fire" rows.
@@ -6061,19 +6071,30 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
                                              side="YES", ask_price=yes_ask,
                                              yes_ask=yes_ask, no_ask=no_ask,
                                              yes_bid=yes_bid, no_bid=no_bid)
+            else:
+                # v6.5.11: update running low throughout streak
+                if mdm.bss_yes_leg1_low is None or yes_ask < mdm.bss_yes_leg1_low:
+                    mdm.bss_yes_leg1_low = yes_ask
         else:
             setattr(mdm, yes_st_field, None)
+            mdm.bss_yes_leg1_low = None  # v6.5.11: reset low when streak breaks
         # NO streak
         if no_ask < t_first:
             if getattr(mdm, no_st_field) is None:
                 setattr(mdm, no_st_field, now)
+                mdm.bss_no_leg1_low = no_ask  # v6.5.11: init low at streak start
                 # v6.5.3: log candidate detection (streak start).
                 _bs_log_bss_candidate_event(state, mdm, now,
                                              side="NO", ask_price=no_ask,
                                              yes_ask=yes_ask, no_ask=no_ask,
                                              yes_bid=yes_bid, no_bid=no_bid)
+            else:
+                # v6.5.11: update running low throughout streak
+                if mdm.bss_no_leg1_low is None or no_ask < mdm.bss_no_leg1_low:
+                    mdm.bss_no_leg1_low = no_ask
         else:
             setattr(mdm, no_st_field, None)
+            mdm.bss_no_leg1_low = None  # v6.5.11: reset low when streak breaks
         # Sustain check (longer streak wins on tie — deterministic)
         yes_sus_s = ((now - getattr(mdm, yes_st_field))
                      if getattr(mdm, yes_st_field) else 0.0)
@@ -6122,6 +6143,22 @@ def _bs_evaluate_bss_entry(state: BotState, mdm: MultiDurationMarket,
                           f"side={fire_side} ask={fire_price:.3f} "
                           f"drop_{int(_BS_BSS_OPP_VEL_LOOKBACK_S)}s={same_drop:+.4f} "
                           f"(still falling; wait for better entry)", flush=True)
+                    return
+            # v6.5.11: LEG1 MAX_BOUNCE CHECK.
+            # Don't fire if current price has bounced more than
+            # BS_BSS_LEG1_MAX_BOUNCE above the running low seen during this
+            # sustain streak. Waits for price to re-dip close to the bottom
+            # rather than buying mid-bounce.
+            if _BS_BSS_LEG1_MAX_BOUNCE > 0:
+                _low_field = "bss_yes_leg1_low" if fire_side == "YES" else "bss_no_leg1_low"
+                _leg1_low = getattr(mdm, _low_field, None)
+                if _leg1_low is not None and fire_price > _leg1_low + _BS_BSS_LEG1_MAX_BOUNCE:
+                    print(f"[bss_entry] FIRST_LEG_BOUNCE_WAIT "
+                          f"market={market.condition_id[:10]}… "
+                          f"side={fire_side} ask={fire_price:.3f} "
+                          f"low={_leg1_low:.3f} "
+                          f"bounce={fire_price - _leg1_low:.3f}>{_BS_BSS_LEG1_MAX_BOUNCE:.3f} "
+                          f"(bounced too far from low; waiting for re-dip)", flush=True)
                     return
             mdm.bss_first_side = fire_side
             mdm.bss_first_price = fire_price
